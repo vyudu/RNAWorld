@@ -3,6 +3,8 @@ using OptimizationBBO
 using OrdinaryDiffEqVerner
 using OrdinaryDiffEqRosenbrock
 
+# Add random comment
+
 init_controller = Returns(1.)
 const V_lo = 0.1
 const V_hi = 10.
