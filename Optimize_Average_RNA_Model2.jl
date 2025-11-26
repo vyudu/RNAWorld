@@ -356,6 +356,7 @@ plot!(sol_sig.t, RNA_vals, lw=3, label="RNA",   color=:purple)
 xlabel!("Time")
 ylabel!("Concentration")
 title!("Species Dynamics under Optimized Sinusoidal V(t)")
+<<<<<<< HEAD
 
 # ==========================================
 # File: Optimize_Average_RNA_Model.jl
@@ -750,3 +751,5 @@ sol_sin = simulate_sinusoidal(params, n0, tspan, A_opt, ω_opt, ϕ_opt)
 RNA_sin = getindex.(sol_sin.u, 5)
 plot(sol_sin.t, RNA_sin, lw=2, xlabel="Time", ylabel="[RNA]",
      title="RNA Production (Optimized Sinusoidal Control)", color=:blue)
+=======
+>>>>>>> ad50df5e1cc487ae393339827ea6111c21806e2a

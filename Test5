@@ -1,8 +1,7 @@
-# Optimize_Average_RNA_Model_fixed.jl
-# Cleaned, single-file version (consolidated and fixed)
+# Optimize_Average_RNA_Model_fixed_optimized.jl
 using Pkg
-Pkg.activate(".") 
-using DifferentialEquations, Optim, Trapz, Random, Plots, Statistics
+Pkg.activate(".")
+using DifferentialEquations, Optim, Random, Plots, Statistics
 
 # -------------------------
 # Global constants & params
@@ -11,10 +10,10 @@ const eps_div = 1e-9
 Vmin, Vmax = 1, 100.0
 tspan = (0.0, 100.0)
 t_steps = range(tspan[1], tspan[2], length=301)  # consistent save grid for all sims
+const SAVEAT = collect(t_steps)                   # precomputed save grid (avoid repeated collect)
 n0 = [100.0, 500.0, 500.0, 100.0, 0.0]   # initial conditions: [α, Cp, αCp, CppC, RNA]
 
 # Example starting params (k1,k2,k3,k4,k5,c6,Kd,D1) - used only for example plots later
-
 params_example = (39.810717055349734, 79.43282347242814, 1.2589254117941673, 6.309573444801933, 39.810717055349734, 0.0199526231496888, 100.0, 0.00630957344480193)
 
 # -------------------------
@@ -58,19 +57,41 @@ end
 # Simulation wrappers (consistent save grid)
 # -------------------------
 # simulate with sinusoidal control (A, ω, ϕ)
-function simulate_sinusoidal(p::NTuple, n0, tspan, A, ω, ϕ; saveat = t_steps)
+function simulate_sinusoidal(p::NTuple, n0, tspan, A, ω, ϕ; saveat = SAVEAT)
     f!(du, u, p_, t) = model!(du, u, p_, t, sinusoidal_V(t, A, ω, ϕ))
     prob = ODEProblem(f!, copy(n0), tspan, p)
-    sol = solve(prob, Tsit5(); abstol=1e-8, reltol=1e-8, saveat=collect(saveat))
+    # use stiff solver for biochemical kinetics
+    sol = solve(prob, Rosenbrock23(); abstol=1e-8, reltol=1e-8, saveat=saveat)
     return sol
 end
 
 # simulate with constant V
-function simulate_constant(p::NTuple, n0, tspan, Vconst; saveat = t_steps)
+function simulate_constant(p::NTuple, n0, tspan, Vconst; saveat = SAVEAT)
     f!(du, u, p_, t) = model!(du, u, p_, t, Vconst)
     prob = ODEProblem(f!, copy(n0), tspan, p)
-    sol = solve(prob, Tsit5(); abstol=1e-8, reltol=1e-8, saveat=collect(saveat))
+    sol = solve(prob, Rosenbrock23(); abstol=1e-8, reltol=1e-8, saveat=saveat)
     return sol
+end
+
+# -------------------------
+# Fast average-RNA integrator (allocation-light trapezoid on saved grid)
+# -------------------------
+function avg_RNA_from_sol(sol)
+    # manual trapezoid over saved solution to avoid allocations
+    tt = sol.t
+    s = 0.0
+    # sol.u is an array of state vectors at each save time
+    N = length(tt)
+    if N < 2
+        return 0.0
+    end
+    for i in 1:(N-1)
+        y1 = sol.u[i][5]
+        y2 = sol.u[i+1][5]
+        dt = tt[i+1] - tt[i]
+        s += 0.5 * (y1 + y2) * dt
+    end
+    return s / (tt[end] - tt[1])
 end
 
 # -------------------------
@@ -80,16 +101,12 @@ function find_optimal_sinusoidal(params; verbose=false)
     # objective: negative average RNA (we minimize)
     obj(x) = begin
         A, ω, ϕ = x
-        # ensure bounds are respected by objective (in case optimizer tries edge)
-        if A < 0 || ω <= 0
-            return 1e6
-        end
+        # rely on Fminbox bounds; avoid internal penalty branch to reduce overhead
         sol = simulate_sinusoidal(params, n0, tspan, A, ω, ϕ)
         if sol.retcode != :Success
             return 1e6
         end
-        RNA_vals = getindex.(sol.u, 5)
-        avg_RNA = trapz(sol.t, RNA_vals) / (sol.t[end] - sol.t[1])
+        avg_RNA = avg_RNA_from_sol(sol)
         return -avg_RNA
     end
 
@@ -97,10 +114,9 @@ function find_optimal_sinusoidal(params; verbose=false)
     lower = [0.0, 0.01, 0.0]
     upper = [(Vmax - Vmin)/2, 1.0, 2*pi]
     x0 = [ (Vmax - Vmin)/4, 0.05, 0.0 ]
-
     res = optimize(obj, lower, upper, x0,
                    Fminbox(NelderMead()),
-                   Optim.Options(iterations=25000, show_trace=verbose))
+                   Optim.Options(iterations=300, show_trace=verbose))
     A_opt, ω_opt, ϕ_opt = res.minimizer
     best_avg = -res.minimum
     return (A_opt, ω_opt, ϕ_opt), best_avg
@@ -136,14 +152,11 @@ function monte_carlo_search(n_trials::Int=50; require_gain=10.0, verbose=false)
             (Aopt, wopt, phopt), avg_RNA_sig = find_optimal_sinusoidal(params_rand; verbose=false)
 
             # 2) simulate constant Vmin and Vmax on same save grid
-            sol_min = simulate_constant(params_rand, n0, tspan, Vmin; saveat=t_steps)
-            sol_max = simulate_constant(params_rand, n0, tspan, Vmax; saveat=t_steps)
+            sol_min = simulate_constant(params_rand, n0, tspan, Vmin; saveat=SAVEAT)
+            sol_max = simulate_constant(params_rand, n0, tspan, Vmax; saveat=SAVEAT)
 
-            RNA_min = getindex.(sol_min.u, 5)
-            RNA_max = getindex.(sol_max.u, 5)
-
-            avg_RNA_min = trapz(sol_min.t, RNA_min) / (sol_min.t[end] - sol_min.t[1])
-            avg_RNA_max = trapz(sol_max.t, RNA_max) / (sol_max.t[end] - sol_max.t[1])
+            avg_RNA_min = avg_RNA_from_sol(sol_min)
+            avg_RNA_max = avg_RNA_from_sol(sol_max)
 
             if avg_RNA_sig > (avg_RNA_min + require_gain) && avg_RNA_sig > (avg_RNA_max + require_gain)
                 push!(successes, (
@@ -187,36 +200,31 @@ end
 println("\nExample optimized sinusoidal for example params:")
 println("A = $(A_opt), ω = $(ω_opt), ϕ = $(ϕ_opt), avg_RNA = $(avg_opt_example)")
 
-sol_sig = simulate_sinusoidal(params_example, n0, tspan, A_opt, ω_opt, ϕ_opt; saveat=t_steps)
-sol_min = simulate_constant(params_example, n0, tspan, Vmin; saveat=t_steps)
-sol_max = simulate_constant(params_example, n0, tspan, Vmax; saveat=t_steps)
+sol_sig = simulate_sinusoidal(params_example, n0, tspan, A_opt, ω_opt, ϕ_opt; saveat=SAVEAT)
+sol_min = simulate_constant(params_example, n0, tspan, Vmin; saveat=SAVEAT)
+sol_max = simulate_constant(params_example, n0, tspan, Vmax; saveat=SAVEAT)
 
-RNA_sig = getindex.(sol_sig.u, 5)
-RNA_min = getindex.(sol_min.u, 5)
-RNA_max = getindex.(sol_max.u, 5)
-
-avg_sig = trapz(sol_sig.t, RNA_sig) / (sol_sig.t[end] - sol_sig.t[1])
-avg_min = trapz(sol_min.t, RNA_min) / (sol_min.t[end] - sol_min.t[1])
-avg_max = trapz(sol_max.t, RNA_max) / (sol_max.t[end] - sol_max.t[1])
+avg_sig = avg_RNA_from_sol(sol_sig)
+avg_min = avg_RNA_from_sol(sol_min)
+avg_max = avg_RNA_from_sol(sol_max)
 
 # Plot RNA time-courses on same axes
-plt = plot(sol_sig.t, RNA_sig, lw=3, label="Vsig (avg=$(round(avg_sig,digits=2)))", color=:blue)
-plot!(plt, sol_min.t, RNA_min, lw=2, linestyle=:dash, label="Vmin (avg=$(round(avg_min,digits=2)))", color=:red)
-plot!(plt, sol_max.t, RNA_max, lw=2, linestyle=:dot, label="Vmax (avg=$(round(avg_max,digits=2)))", color=:green)
+RNA_sig = [sol_sig.u[i][5] for i in 1:length(sol_sig.t)]
+RNA_min = [sol_min.u[i][5] for i in 1:length(sol_min.t)]
+RNA_max = [sol_max.u[i][5] for i in 1:length(sol_max.t)]
+
+plt = plot(sol_sig.t, RNA_sig, lw=3, label="Vsig (avg=$(round(avg_sig,digits=2)))")
+plot!(plt, sol_min.t, RNA_min, lw=2, linestyle=:dash, label="Vmin (avg=$(round(avg_min,digits=2)))")
+plot!(plt, sol_max.t, RNA_max, lw=2, linestyle=:dot, label="Vmax (avg=$(round(avg_max,digits=2)))")
 xlabel!("Time")
 ylabel!("[RNA]")
 title!("RNA production: Vsig vs Vmin vs Vmax (example params)")
 display(plt)
-plot(Vopt)
-
-
+# Note: `plot(Vopt)` in original script looked like stray call; left out to avoid error.
 
 # ===========================
 # Plot Vsig(t) for optimized control
 # ===========================
-
-using Plots
-
 # Vsig(t) function
 function Vsig(t, A, ω, ϕ)
     Vmean = (Vmax + Vmin) / 2
