@@ -19,7 +19,7 @@ const SAVEAT_FAST = collect(range(tspan[1], tspan[2], length=101))  # 101 -> bet
 n0 = [100.0, 50.0, 10.0, 50.0, 100.]   # initial conditions: [α, Cp, αCp, CppC, RNA]
 
 # Example starting params (k1,k2,k3,k4,k5,c6,Kd,D1) - used only for example plots later
-params_example = (0.15848931924611134, 0.010715193052376065, 0.33884415613920255, 0.03630780547701014, 0.010471285480508996, 18.197008586099834, 0.19498445997580455, 0.8511380382023764)
+params_example = (0.0223872113856834, 0.057543993733715694, 0.19952623149688797, 0.28183829312644537, 0.2691534803926916, 19.498445997580454, 0.42657951880159267, 0.7585775750291838)
 
 # -----------------------
 # Reaction model 
@@ -35,7 +35,7 @@ function rates(n::AbstractVector, V, p)
     r4 = k4 * (α * Cp) / (Vsafe^2)
     r5 = k5 * αCp / Vsafe
     r6 = c6 * (CppC / Vsafe) / (1 + (Cp + αCp) / (Kd * Vsafe))
-    r7 = D1 * RNA / Vsafe
+    r7 = D1 / Vsafe
     return r1,r2,r3,r4,r5,r6,r7
 end
 
@@ -362,3 +362,34 @@ function find_optimal_sinusoidal(params; verbose=false)
 
     return (A_opt, ω_opt, ϕ_opt), avg
 end
+
+
+
+
+
+
+
+
+
+
+# ===========================
+# Plot ALL species in the Vsig simulation    
+# Names of the 5 tracked species
+species_names = ["α", "Cp", "αCp", "CppC", "RNA"]
+
+# Create the plot object
+plt_sig = plot(
+    title = "All Species Under Vsigmoid",
+    xlabel = "Time",
+    ylabel = "Concentration",
+    lw = 2
+)
+
+# Loop through species 1 to 5 and extract values
+for idx in 1:5
+    species_vals = [sol_sig.u[i][idx] for i in 1:length(sol_sig.t)]
+    plot!(plt_sig, sol_sig.t, species_vals, label = species_names[idx])
+end
+
+# Display the combined figure
+display(plt_sig)

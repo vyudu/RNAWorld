@@ -1,0 +1,466 @@
+###############################################################
+# Volume-Controlled Linear Model
+# Forward-backward sweep optimization + constant-volume controls
+# Plots for Vopt, Vmin, Vmax; A/B/C under Vopt; C(t) comparison;
+# Random parameter search (finds parameter sets where Vopt beats all constant controls)
+###############################################################
+using Pkg
+Pkg.activate(".")
+using DifferentialEquations
+using ForwardDiff
+using Optim
+using Random
+using Plots
+
+# -----------------------
+# GLOBAL CONSTANTS
+# -----------------------
+const ϵ = 1e-8
+const Vmin = 0.1
+const Vmax = 100.0
+
+# -----------------------
+# RATE LAWS (NO Ki)
+# -----------------------
+rate1(A, V, k1) = V * k1 * (A / (V + ϵ))
+rate3(C, V, k3) = V * k3 * (C / (V + ϵ))
+# inhibition only via D and Kd
+rate2(B, V, k2, D, Kd) = V * k2 * (B / (V + ϵ)) / (1 + (D / (V + ϵ)) / Kd)
+
+# -----------------------
+# STATE EQUATIONS
+# n = [A, B, C]
+# -----------------------
+function state_dynamics!(du, n, p, t, λ, V, k1, k2, k3, D, Kd)
+    A, B, C = n
+    r1 = rate1(A, V, k1)
+    r2 = rate2(B, V, k2, D, Kd)
+    r3 = rate3(C, V, k3)
+    du[1] = -r1
+    du[2] =  r1 - r2
+    du[3] =  r2 - r3
+end
+
+# -----------------------
+# HAMILTONIAN
+# -----------------------
+function H(n, λ, V, k1, k2, k3, D, Kd)
+    A, B, C = n
+    L1, L2, L3 = λ
+    r1 = rate1(A, V, k1)
+    r2 = rate2(B, V, k2, D, Kd)
+    r3 = rate3(C, V, k3)
+    return L1*(-r1) + L2*(r1 - r2) + L3*(r2 - r3)
+end
+
+# -----------------------
+# ADJOINT ODE (∂H/∂n)
+# -----------------------
+function adjoint_dynamics!(dl, λ, n, V, k1, k2, k3, D, Kd)
+    dl .= -ForwardDiff.gradient(x -> H(x, λ, V, k1, k2, k3, D, Kd), n)
+end
+
+# -----------------------
+# OPTIMAL CONTROL (PMP)
+# -----------------------
+function optimal_V(n, λ, k1, k2, k3, D, Kd)
+    obj(V) = -H(n, λ, V, k1, k2, k3, D, Kd)   # minimize -H -> maximize H
+    res = optimize(obj, Vmin, Vmax, Brent())
+    return clamp(Optim.minimizer(res), Vmin, Vmax)
+end
+
+# -----------------------
+# CONSTANT CONTROLS
+# -----------------------
+const_control_Vmax(n, λ, k1, k2, k3, D, Kd) = Vmax
+const_control_Vmin(n, λ, k1, k2, k3, D, Kd) = Vmin
+const_control_Vmean(n, λ, k1, k2, k3, D, Kd) = (Vmin + Vmax)/2
+
+# -----------------------
+# FORWARD-BACKWARD SWEEP
+# -----------------------
+"""
+forward_backward_sweep(n0, λT, tspan, tsteps; k1,k2,k3,D,Kd, control_update)
+returns: sol_n, sol_λ, V_values
+- sol_n: solution object for forward state (callable)
+- sol_λ: solution object for backward adjoint (callable, saved on reversed grid)
+- V_values: array of V(t) used (length == length(tsteps))
+"""
+function forward_backward_sweep(n0, λT, tspan, tsteps;
+                                k1, k2, k3, D, Kd,
+                                control_update = (n,λ,k1,k2,k3,D,Kd)->optimal_V(n,λ,k1,k2,k3,D,Kd),
+                                sweeps::Int=20)
+
+    Nt = length(tsteps)
+    V_values = fill((Vmin + Vmax)/2, Nt)
+    sol_n = nothing
+    sol_λ = nothing
+
+    for sweep in 1:sweeps
+        # Forward ODE (uses current V_values)
+        function forward_ode!(du, u, p, t)
+            idx = findfirst(x -> x ≥ t, tsteps)
+            idx = clamp(idx, 1, Nt)
+            V = V_values[idx]
+            # pass nothing for λ argument (not used)
+            state_dynamics!(du, u, p, t, nothing, V, k1, k2, k3, D, Kd)
+        end
+        prob_fwd = ODEProblem(forward_ode!, n0, tspan)
+        sol_n = solve(prob_fwd, Tsit5(), saveat=tsteps)
+
+        # Backward ODE for adjoint (integrate from t_f -> t_0)
+        function backward_ode!(dl, λ, p, t)
+            # find index from reversed timepoints
+            idx = findfirst(x -> x ≥ t, reverse(tsteps))
+            idx = clamp(idx, 1, Nt)
+            n_at = sol_n(tsteps[end - idx + 1])
+            V = V_values[end - idx + 1]
+            adjoint_dynamics!(dl, λ, n_at, V, k1, k2, k3, D, Kd)
+        end
+        prob_bwd = ODEProblem(backward_ode!, λT, (tspan[2], tspan[1]))
+        sol_λ = solve(prob_bwd, Tsit5(), saveat=reverse(tsteps))
+
+        # Update control pointwise using current forward & backward solutions
+        for (i, t) in enumerate(tsteps)
+            n_t = sol_n(t)
+            # sol_λ is saved on reversed grid; adjoint at time t is sol_λ(t_f - t + t0?) 
+            # We saved with saveat=reverse(tsteps) so sol_λ(tspan[2] - t) returns adjoint at t
+            λ_t = sol_λ(tspan[2] - t)
+            V_values[i] = control_update(n_t, λ_t, k1, k2, k3, D, Kd)
+        end
+    end
+
+    return sol_n, sol_λ, V_values
+end
+
+# -----------------------
+# RUN SIMULATION & RETURN MAX C FOR ALL CONTROLS
+# params = (k1,k2,k3,Kd,D)
+# -----------------------
+function run_main_simulation_for_params(params; tspan=(0.0,3.0), Nt=300, sweeps=20)
+    k1, k2, k3, Kd, D = params
+    tsteps = range(tspan[1], tspan[2], length=Nt)
+    n0 = [200.0, 0.0, 0.0]
+    λT = [0.0, 0.0, 1.0]
+
+    # Optimal control
+    sol_opt, sol_λ_opt, V_opt = forward_backward_sweep(n0, λT, tspan, tsteps;
+                                                      k1=k1,k2=k2,k3=k3,D=D,Kd=Kd,
+                                                      control_update=(n,λ,k1,k2,k3,D,Kd)->optimal_V(n,λ,k1,k2,k3,D,Kd),
+                                                      sweeps=sweeps)
+    C_opt = [sol_opt(t)[3] for t in tsteps]
+    maxC_opt = maximum(C_opt)
+
+    # Constant Vmax
+    sol_Vmax, _, Vvals_Vmax = forward_backward_sweep(n0, λT, tspan, tsteps;
+                                                     k1=k1,k2=k2,k3=k3,D=D,Kd=Kd,
+                                                     control_update=(n,λ,k1,k2,k3,D,Kd)->const_control_Vmax(n,λ,k1,k2,k3,D,Kd),
+                                                     sweeps=sweeps)
+    C_Vmax = [sol_Vmax(t)[3] for t in tsteps]
+    maxC_Vmax = maximum(C_Vmax)
+
+    # Constant Vmin
+    sol_Vmin, _, Vvals_Vmin = forward_backward_sweep(n0, λT, tspan, tsteps;
+                                                     k1=k1,k2=k2,k3=k3,D=D,Kd=Kd,
+                                                     control_update=(n,λ,k1,k2,k3,D,Kd)->const_control_Vmin(n,λ,k1,k2,k3,D,Kd),
+                                                     sweeps=sweeps)
+    C_Vmin = [sol_Vmin(t)[3] for t in tsteps]
+    maxC_Vmin = maximum(C_Vmin)
+
+    # Constant Vmean
+    sol_Vmean, _, Vvals_Vmean = forward_backward_sweep(n0, λT, tspan, tsteps;
+                                                       k1=k1,k2=k2,k3=k3,D=D,Kd=Kd,
+                                                       control_update=(n,λ,k1,k2,k3,D,Kd)->const_control_Vmean(n,λ,k1,k2,k3,D,Kd),
+                                                       sweeps=sweeps)
+    C_Vmean = [sol_Vmean(t)[3] for t in tsteps]
+    maxC_Vmean = maximum(C_Vmean)
+
+    return Dict(
+        :tsteps => tsteps,
+        :sol_opt => sol_opt, :V_opt => V_opt, :C_opt => C_opt, :maxC_opt => maxC_opt,
+        :sol_Vmax => sol_Vmax, :C_Vmax => C_Vmax, :maxC_Vmax => maxC_Vmax,
+        :sol_Vmin => sol_Vmin, :C_Vmin => C_Vmin, :maxC_Vmin => maxC_Vmin,
+        :sol_Vmean => sol_Vmean, :C_Vmean => C_Vmean, :maxC_Vmean => maxC_Vmean
+    )
+end
+
+# -----------------------
+# PLOTTING UTILITIES
+# -----------------------
+function make_plots(result_dict; title_suffix = "")
+    tsteps = result_dict[:tsteps]
+
+    # Plot Vopt and horizontal lines for Vmin and Vmax
+    pV = plot(tsteps, result_dict[:V_opt], label="V_opt(t)", lw=2)
+    plot!(pV, [first(tsteps), last(tsteps)], [Vmin, Vmin], label="Vmin", lw=2, ls=:dash)
+    plot!(pV, [first(tsteps), last(tsteps)], [Vmax, Vmax], label="Vmax", lw=2, ls=:dashdot)
+    xlabel!(pV, "Time"); ylabel!(pV, "Volume V(t)")
+    title!(pV, "Volume control: V_opt vs Vmin/Vmax $title_suffix")
+
+    # Plot A,B,C for Vopt
+    sol_opt = result_dict[:sol_opt]
+    A_opt = [sol_opt(t)[1] for t in tsteps]
+    B_opt = [sol_opt(t)[2] for t in tsteps]
+    C_opt = result_dict[:C_opt]
+    pABC = plot(tsteps, A_opt, label="A (Vopt)", lw=2)
+    plot!(pABC, tsteps, B_opt, label="B (Vopt)", lw=2)
+    plot!(pABC, tsteps, C_opt, label="C (Vopt)", lw=2)
+    xlabel!(pABC, "Time"); ylabel!(pABC, "Concentration")
+    title!(pABC, "A, B, C vs Time under V_opt $title_suffix")
+
+    # Plot comparison of C(t) for controls
+    pC = plot(tsteps, C_opt, label="C (Vopt)", lw=2)
+    plot!(pC, tsteps, result_dict[:C_Vmax], label="C (Vmax)", lw=2, ls=:dash)
+    plot!(pC, tsteps, result_dict[:C_Vmin], label="C (Vmin)", lw=2, ls=:dot)
+    plot!(pC, tsteps, result_dict[:C_Vmean], label="C (Vmean)", lw=2, ls=:dashdot)
+    xlabel!(pC, "Time"); ylabel!(pC, "Concentration C")
+    title!(pC, "C(t) under different controls $title_suffix")
+
+    # layout
+    plot(pV, pABC, pC, layout=(3,1), size=(900,1000))
+end
+
+# -----------------------
+# QUICK EXAMPLE (single parameter set)
+# -----------------------
+example_params = (1.5, 0.8, 1.5, 0.8, 0.3)  # (k1,k2,k3,Kd,D)
+println("Running example params: ", example_params)
+res_example = run_main_simulation_for_params(example_params; tspan=(0.0,3.0), Nt=300, sweeps=20)
+println("Max C (Vopt) = ", round(res_example[:maxC_opt], digits=4),
+        "  |  Max C (Vmax) = ", round(res_example[:maxC_Vmax], digits=4),
+        "  |  Max C (Vmin) = ", round(res_example[:maxC_Vmin], digits=4),
+        "  |  Max C (Vmean) = ", round(res_example[:maxC_Vmean], digits=4))
+
+# Original combined plots
+display(make_plots(res_example, title_suffix="(example)"))
+
+# -----------------------
+# Additional plot: C(t) comparison for Vopt, Vmin, Vmax only
+# -----------------------
+tsteps = res_example[:tsteps]
+plot(tsteps, res_example[:C_opt], label="C (Vopt)", lw=2)
+plot!(tsteps, res_example[:C_Vmax], label="C (Vmax)", lw=2, ls=:dash)
+plot!(tsteps, res_example[:C_Vmin], label="C (Vmin)", lw=2, ls=:dot)
+xlabel!("Time")
+ylabel!("Concentration C")
+title!("C(t) under Vopt, Vmin, Vmax (example)")
+display(current())
+# -----------------------
+# PARAMETER SEARCH (randomized)
+# - Samples Ntrials random parameter sets
+# - Records parameter sets where maxC_opt > maxC_Vmax && > maxC_Vmin && > maxC_Vmean
+# - Prints and keeps the best by difference (maxC_opt - best_constant)
+# ----------------------
+# --- Parameter search for Model 2 --- 
+"""
+Run the main simulation for a given parameter set and return max C for Vmax, Vmin, Vmean, and optimal.
+"""
+function run_main_simulation_for_params(params)
+    k1, k2, k3, Kd, D = params
+    Vmin = 0.1; Vmax = 100.0
+    ϵ = 1e-8
+    n0 = [200.0, 0.0, 0.0]
+    λT = [0.0, 0.0, 1.0]
+    tspan = (0.0, 3.0)
+    tsteps = range(tspan[1], tspan[2], length=300)
+    rate1(A, C, V) = V * k1 * (A / (V + ϵ))
+    rate2(B, V, D) = V * k2 * (B / (V + ϵ)) / (1 + (D / (V + ϵ)) / Kd)
+    rate3(C, V) = V * k3 * (C / (V + ϵ))
+    function state_dynamics!(du, n, p, t, λ, V, D)
+        A, B, C = n
+        r1 = rate1(A, C, V)
+        r2 = rate2(B, V, D)
+        r3 = rate3(C, V)
+        du[1] = -r1
+        du[2] = r1 - r2
+        du[3] = r2 - r3
+    end
+    function H(n, λ, V, D)
+        A, B, C = n
+        L1, L2, L3 = λ
+        r1 = rate1(A, C, V)
+        r2 = rate2(B, V, D)
+        r3 = rate3(C, V)
+        return L1 * (-r1) + L2 * (r1 - r2) + L3 * (r2 - r3)
+    end
+    function adjoint_dynamics!(dl, λ, n, V, D)
+        # PMP: dl/dt = -∂H/∂n
+        dl .= -ForwardDiff.gradient(n_ -> H(n_, λ, V, D), n)
+    end
+    function optimal_V(n, λ)
+        obj(V) = -H(n, λ, V, D)
+        res = optimize(obj, Vmin, Vmax, Brent())
+        Vopt = Optim.minimizer(res)
+        return clamp(Vopt, Vmin, Vmax)
+    end
+    function control_Vmax(n, λ) Vmax end
+    function control_Vmin(n, λ) Vmin end
+    control_Vmean(n, λ) = (Vmin + Vmax) / 2
+    function forward_backward_sweep_local(n0, λT, tspan, tsteps; control_update=optimal_V)
+        V_vals = fill((Vmin + Vmax) / 2, length(tsteps))
+        sol_n, sol_λ = nothing, nothing
+        for sweep in 1:20
+            function forward_ode!(du, u, p, t)
+                idx = findfirst(x -> x ≥ t, tsteps)
+                V = V_vals[clamp(idx, 1, length(V_vals))]
+                λ_dummy = zeros(3)
+                state_dynamics!(du, u, p, t, λ_dummy, V, D)
+            end
+            prob_fwd = ODEProblem(forward_ode!, n0, tspan)
+            sol_n = solve(prob_fwd, Tsit5(), saveat=tsteps)
+            function backward_ode!(dl, l, p, t)
+                idx = findfirst(x -> x ≥ t, reverse(tsteps))
+                n = sol_n(tsteps[end - idx + 1])
+                V = V_vals[end - idx + 1]
+                adjoint_dynamics!(dl, l, n, V, D)
+            end
+            prob_bwd = ODEProblem(backward_ode!, λT, (tspan[2], tspan[1]))
+            sol_λ = solve(prob_bwd, Tsit5(), saveat=reverse(tsteps))
+            for (i, t) in enumerate(tsteps)
+                n_t = sol_n(t)
+                λ_t = sol_λ(tspan[2] - t)
+                V_vals[i] = control_update(n_t, λ_t)
+            end
+        end
+        return sol_n, sol_λ, V_vals
+    end
+    sol_n_num, sol_λ_num, V_num = forward_backward_sweep_local(n0, λT, tspan, tsteps; control_update=optimal_V)
+    C_num = [sol_n_num(t)[3] for t in tsteps]
+    maxC_num = maximum(C_num)
+    sol_n_Vmax, _, _ = forward_backward_sweep_local(n0, λT, tspan, tsteps; control_update=control_Vmax)
+    sol_n_Vmin, _, _ = forward_backward_sweep_local(n0, λT, tspan, tsteps; control_update=control_Vmin)
+    sol_n_Vmean, _, _ = forward_backward_sweep_local(n0, λT, tspan, tsteps; control_update=control_Vmean)
+    C_Vmax = [sol_n_Vmax(t)[3] for t in tsteps]
+    C_Vmin = [sol_n_Vmin(t)[3] for t in tsteps]
+    C_Vmean = [sol_n_Vmean(t)[3] for t in tsteps]
+    maxC_Vmax = maximum(C_Vmax)
+    maxC_Vmin = maximum(C_Vmin)
+    maxC_Vmean = maximum(C_Vmean)
+    return maxC_num, maxC_Vmax, maxC_Vmin, maxC_Vmean
+end
+
+function simulate_and_compare_model2(params)
+    k1, k2, k3, Kd, D = params
+    Vmin = 0.1; Vmax = 100.0
+    n0 = [200.0, 0.0, 0.0]  # match main script
+    λT = [0.0, 0.0, 1.0]
+    tspan = (0.0, 3.0)
+    tsteps = range(tspan[1], tspan[2], length=300)
+    # Use the same rate definitions as main script (with V factor)
+    function rate1(A, C, V) V * k1 * (A / (V + 1e-8)) end
+    function rate2(B, V, D) V * k2 * (B / (V + 1e-8)) / (1 + (D / (V + 1e-8)) / Kd) end
+    function rate3(C, V) V * k3 * (C / (V + 1e-8)) end
+    function state_dynamics!(du, n, p, t, λ, V, D)
+        A, B, C = n
+        r1 = rate1(A, C, V)
+        r2 = rate2(B, V, D)
+        r3 = rate3(C, V)
+        du[1] = -r1
+        du[2] = r1 - r2
+        du[3] = r2 - r3
+    end
+    function H(n, λ, V, D)
+        A, B, C = n
+        L1, L2, L3 = λ
+        r1 = rate1(A, C, V)
+        r2 = rate2(B, V, D)
+        r3 = rate3(C, V)
+        return L1 * (-r1) + L2 * (r1 - r2) + L3 * (r2 - r3)
+    end
+    function adjoint_dynamics!(dl, λ, n, V, D)
+        dl .= -ForwardDiff.gradient(n_ -> H(n_, λ, V, D), n)
+    end
+    function optimal_V(n, λ)
+        obj(V) = -H(n, λ, V, D)
+        res = optimize(obj, Vmin, Vmax, Brent())
+        Vopt = Optim.minimizer(res)
+        return clamp(Vopt, Vmin, Vmax)
+    end
+    function control_Vmax(n, λ) Vmax end
+    function control_Vmin(n, λ) Vmin end
+    control_Vmean(n, λ) = (Vmin + Vmax) / 2
+    function forward_backward_sweep_local(n0, λT, tspan, tsteps; control_update=optimal_V)
+        V_vals = fill((Vmin + Vmax) / 2, length(tsteps))
+        sol_n, sol_λ = nothing, nothing
+        for sweep in 1:20
+            function forward_ode!(du, u, p, t)
+                idx = findfirst(x -> x ≥ t, tsteps)
+                V = V_vals[clamp(idx, 1, length(V_vals))]
+                λ_dummy = zeros(3)
+                state_dynamics!(du, u, p, t, λ_dummy, V, D)
+            end
+            prob_fwd = ODEProblem(forward_ode!, n0, tspan)
+            sol_n = solve(prob_fwd, Tsit5(), saveat=tsteps)
+            function backward_ode!(dl, l, p, t)
+                idx = findfirst(x -> x ≥ t, reverse(tsteps))
+                n = sol_n(tsteps[end - idx + 1])
+                V = V_vals[end - idx + 1]
+                adjoint_dynamics!(dl, l, n, V, D)
+            end
+            prob_bwd = ODEProblem(backward_ode!, λT, (tspan[2], tspan[1]))
+            sol_λ = solve(prob_bwd, Tsit5(), saveat=reverse(tsteps))
+            for (i, t) in enumerate(tsteps)
+                n_t = sol_n(t)
+                λ_t = sol_λ(tspan[2] - t)
+                V_vals[i] = control_update(n_t, λ_t)
+            end
+        end
+        return sol_n, sol_λ, V_vals
+    end
+    sol_n_num, sol_λ_num, V_num = forward_backward_sweep_local(n0, λT, tspan, tsteps; control_update=optimal_V)
+    C_num = [sol_n_num(t)[3] for t in tsteps]
+    maxC_num = maximum(C_num)
+    sol_n_Vmax, _, _ = forward_backward_sweep_local(n0, λT, tspan, tsteps; control_update=control_Vmax)
+    sol_n_Vmin, _, _ = forward_backward_sweep_local(n0, λT, tspan, tsteps; control_update=control_Vmin)
+    sol_n_Vmean, _, _ = forward_backward_sweep_local(n0, λT, tspan, tsteps; control_update=control_Vmean)
+    C_Vmax = [sol_n_Vmax(t)[3] for t in tsteps]
+    C_Vmin = [sol_n_Vmin(t)[3] for t in tsteps]
+    C_Vmean = [sol_n_Vmean(t)[3] for t in tsteps]
+    maxC_Vmax = maximum(C_Vmax)
+    maxC_Vmin = maximum(C_Vmin)
+    maxC_Vmean = maximum(C_Vmean)
+    maxC_const_all = maximum([maxC_Vmax, maxC_Vmin, maxC_Vmean])
+    if length(C_num) != 300 || length(C_Vmax) != 300 || length(C_Vmin) != 300 || length(C_Vmean) != 300
+        error("ODE solution did not return 300 points. C_num: $(length(C_num)), C_Vmax: $(length(C_Vmax)), C_Vmin: $(length(C_Vmin)), C_Vmean: $(length(C_Vmean))")
+    end
+    return maxC_num - maxC_const_all, maxC_num, maxC_Vmax, maxC_Vmin, maxC_Vmean, params
+end
+
+println("\n--- Model 2 Parameter Search (diff > 0.5) ---")
+best2 = (-Inf, 0, 0, 0, 0, zeros(5))
+found = false
+for trial in 1:500
+    k1 = rand(0.1:0.1:2.0)
+    k2 = rand(0.1:0.1:2.0)
+    k3 = rand(0.1:0.1:2.0)
+    Kd = rand(0.1:0.1:2.0)
+    D = rand(0.1:0.1:10.0)
+    diff, maxC_num, maxC_Vmax, maxC_Vmin, maxC_Vmean, params = simulate_and_compare_model2([k1, k2, k3, Kd, D])
+    if diff > 0.5 && isfinite(diff) && isfinite(maxC_num) && isfinite(maxC_Vmax) && isfinite(maxC_Vmin) && isfinite(maxC_Vmean)
+        println("Params: k1=", params[1], ", k2=", params[2], ", k3=", params[3], ", Kd=", params[4], ", D=", params[5])
+        println("Numerical optimal max C: ", round(maxC_num, digits=4))
+        println("Constant Vmax max C: ", round(maxC_Vmax, digits=4))
+        println("Constant Vmin max C: ", round(maxC_Vmin, digits=4))
+        println("Constant Vmean max C: ", round(maxC_Vmean, digits=4))
+        println("Difference (numerical - best constant): ", round(diff, digits=4))
+        if diff > best2[1]
+            best2 = (diff, maxC_num, maxC_Vmax, maxC_Vmin, maxC_Vmean, params)
+        end
+        found = true
+    end
+end
+if found
+    println("\nBest found (diff > 0.5):")
+    println("Difference: ", best2[1])
+    println("Numerical optimal max C (parameter search): ", best2[2])
+    println("Vmax (parameter search): ", best2[3], ", Vmin: ", best2[4], ", Vmean: ", best2[5])
+    println("Params: k1=", best2[6][1], ", k2=", best2[6][2], ", k3=", best2[6][3], ", Kd=", best2[6][4], ", D=", best2[6][5])
+    maxC_num_main, maxC_Vmax_main, maxC_Vmin_main, maxC_Vmean_main = run_main_simulation_for_params(best2[6])
+    println("\n--- Main simulation with best parameter set ---")
+    println("Numerical optimal max C (main): ", round(maxC_num_main, digits=4))
+    println("Vmax (main): ", round(maxC_Vmax_main, digits=4), ", Vmin: ", round(maxC_Vmin_main, digits=4), ", Vmean: ", round(maxC_Vmean_main, digits=4))
+    println("\nCompare: If these do not match, check for hidden differences in rates, ICs, or time grid.")
+else
+    println("\nNo parameter set found where numerical optimal C exceeds all constant controls by more than 0.5.")
+end
+
