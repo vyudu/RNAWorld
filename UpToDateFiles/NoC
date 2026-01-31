@@ -1,0 +1,1025 @@
+using Pkg
+Pkg.activate(".")
+using DifferentialEquations, Optim, Random, Plots, Statistics
+include("NoCinhibition.jl")
+# Parameters
+k1, k2, k3, D, Kd = 0.7943282347242815, 5.011872336272722, 4.466835921509632, 7.079457843841379, 0.28183829312644537
+
+Vmin, Vmax = 1.0, 100.0
+ϵ = 1e-8  # small value to avoid division by zero
+# Rates with stabilizers
+# Restore C inhibition to A->B rate
+rate1(A, C, V) = V * k1 * (A / (V + ϵ))
+rate2(B, V, D) = V * k2 * (B / (V + ϵ)) / (1 + (D / (V + ϵ)) / Kd)
+rate3(C, V) = V * k3 * (C / (V + ϵ))
+
+# System dynamics: n = [A, B, C]
+function state_dynamics!(du, n, p, t, λ, V, D)
+    A, B, C = n
+    r1 = rate1(A, C, V)
+    r2 = rate2(B, V, D)
+    r3 = rate3(C, V)
+    du[1] = -r1
+    du[2] = r1 - r2
+    du[3] = r2 - r3
+end
+
+# Hamiltonian
+function H(n, λ, V, D)
+    A, B, C = n
+    L1, L2, L3 = λ
+    r1 = rate1(A, C, V)
+    r2 = rate2(B, V, D)
+    r3 = rate3(C, V)
+    return L1 * (-r1) + L2 * (r1 - r2) + L3 * (r2 - r3)
+end
+
+# Adjoint dynamics
+function adjoint_dynamics!(dl, λ, n, V, D)
+    dl .= -ForwardDiff.gradient(n -> H(n, λ, V, D), n)
+end
+
+# Pontryagin's Maximum Principle: maximize Hamiltonian w.r.t. V
+function optimal_V(n, λ)
+    obj(V) = -H(n, λ, V, D)  # minimize -H is same as maximize H
+    res = optimize(obj, Vmin, Vmax, Brent())
+    Vopt = Optim.minimizer(res)
+    return clamp(Vopt, Vmin, Vmax)
+end
+
+# Forward-backward sweep
+function forward_backward_sweep(n0, λT, tspan, tsteps; control_update=optimal_V, iters = 100)
+    V_vals = fill((Vmin + Vmax) / 2, length(tsteps))
+    sol_n, sol_λ = nothing, nothing
+    for sweep in 1:iters
+        println("Sweep $sweep")
+        λ_dummy = zeros(3)
+        # Forward ODE
+        function forward_ode!(du, u, p, t)
+            idx = findfirst(x -> x ≥ t, tsteps)
+            state_dynamics!(du, u, p, t, λ_dummy, V_vals[idx], D)
+        end
+        prob_fwd = ODEProblem(forward_ode!, n0, tspan)
+        sol_n = solve(prob_fwd, Tsit5(), saveat=tsteps)
+
+        # Backward ODE (adjoint)
+        function backward_ode!(dl, l, p, t)
+            idx = findfirst(x -> x ≥ t, tsteps)
+            adjoint_dynamics!(dl, l, sol_n(t), V_vals[idx], D)
+        end
+        prob_bwd = ODEProblem(backward_ode!, λT, (tspan[2], tspan[1]))
+        sol_λ = solve(prob_bwd, Tsit5(), saveat=reverse(tsteps))
+        # Update control using optimal V(t)
+        for (i, t) in enumerate(tsteps)
+            n_t = sol_n(t)
+            λ_t = sol_λ(t)
+            V_vals[i] = control_update(n_t, λ_t)
+        end
+    end
+    return sol_n, sol_λ, V_vals
+end
+
+# Initial conditions
+n0 = [200.0, 0.0, 0.0]  # [A, B, C]
+λT = [0.0, 0.0, 1.0]   # final adjoint state: sensitivity to C
+
+tspan = (0.0, 4.0)
+tsteps = range(tspan[1], tspan[2], length=300)
+
+# Run forward-backward sweep for optimal control
+control_Vmax = Returns(Vmax)
+control_Vmin = Returns(Vmin)
+control_Vmean = Returns((Vmin + Vmax) / 2)
+
+function generate_solutions(n0, λT, tspan, tsteps)
+    sol_n, sol_λ, V_vals = forward_backward_sweep(n0, λT, tspan, tsteps);
+    sol_n_Vmax, _, _ = forward_backward_sweep(n0, λT, tspan, tsteps; control_update=control_Vmax);
+    sol_n_Vmin, _, _ = forward_backward_sweep(n0, λT, tspan, tsteps; control_update=control_Vmin);
+    sol_n_Vmean, _, _ = forward_backward_sweep(n0, λT, tspan, tsteps; control_update=control_Vmean);
+    
+    (; opt = sol_n, max = sol_n_Vmax, min = sol_n_Vmin, mean = sol_n_Vmean)
+end
+
+# Plot all C curves together
+function plot_concentration_curves(sols; idxs = 3)
+    pC = plot(sols.opt, idxs = idxs, label="Optimal V(t)", lw=2)
+    plot!(sols.max, idxs = idxs, label="Constant Vmax", lw=2, ls=:dash)
+    plot!(sols.min, idxs = idxs, label="Constant Vmin", lw=2, ls=:dot)
+    plot!(sols.mean, idxs = idxs, label="Constant Vmean", lw=2, ls=:dashdot)
+    xlabel!("Time")
+    ylabel!("Concentration C")
+    title!("C(t) under different controls")
+end
+
+# Plot V(t) for optimal
+function plot_volume_curve()
+    # This function will be completed in the main block below
+    return nothing
+end
+
+function plot_vc()
+    # This function will be completed in the main block below
+    return nothing
+# === MAIN BLOCK ===
+n0 = [200.0, 0.0, 0.0]
+λT = [0.0, 0.0, 1.0]
+tspan = (0.0, 4.0)
+tsteps = range(tspan[1], tspan[2], length=300)
+
+sols = generate_solutions(n0, λT, tspan, tsteps)
+
+# Extract C(t) for each control
+C_opt = [sols.opt(t)[3] for t in tsteps]
+C_Vmax = [sols.max(t)[3] for t in tsteps]
+C_Vmin = [sols.min(t)[3] for t in tsteps]
+C_Vmean = [sols.mean(t)[3] for t in tsteps]
+
+# Extract V(t) for optimal control
+_, _, V_vals = forward_backward_sweep(n0, λT, tspan, tsteps)
+
+# Print max C for each control
+println("Max C (Optimal): ", maximum(C_opt))
+println("Max C (Vmax): ", maximum(C_Vmax))
+println("Max C (Vmin): ", maximum(C_Vmin))
+println("Max C (Vmean): ", maximum(C_Vmean))
+
+# Plot C curves
+plot_concentration_curves(sols)
+
+# Plot V(t) for optimal control
+plot(tsteps, V_vals, label="Optimal V(t)", lw=2)
+xlabel!("Time")
+ylabel!("Volume V(t)")
+title!("Optimal Control V(t)")
+end
+
+# Plot all together
+
+# Print max C for each control
+println("Max C (Optimal): ", maximum(C_opt))
+println("Max C (Vmax): ", maximum(C_Vmax))
+println("Max C (Vmin): ", maximum(C_Vmin))
+println("Max C (Vmean): ", maximum(C_Vmean))
+
+
+
+# Detect times when Vmax or Vmin used in numerical optimal control
+
+# If V_num, C_num, C_const are not defined, use V_vals, C_opt, C_Vmean as fallback
+# Ensure all required variables are defined in global scope
+sols = generate_solutions(n0, λT, tspan, tsteps)
+C_opt = [sols.opt(t)[3] for t in tsteps]
+C_Vmax = [sols.max(t)[3] for t in tsteps]
+C_Vmin = [sols.min(t)[3] for t in tsteps]
+C_Vmean = [sols.mean(t)[3] for t in tsteps]
+_, _, V_vals = forward_backward_sweep(n0, λT, tspan, tsteps)
+V_num = V_vals
+C_num = C_opt
+C_const = C_Vmean
+times_Vmax = [tsteps[i] for i in 1:length(V_num) if isapprox(V_num[i], Vmax; atol=1e-4)]
+times_Vmin = [tsteps[i] for i in 1:length(V_num) if isapprox(V_num[i], Vmin; atol=1e-4)]
+
+# Compute and print max concentrations for each control
+maxC_num = maximum(C_num)
+maxC_const = maximum(C_const)
+maxC_Vmax = maximum(C_Vmax)
+maxC_Vmin = maximum(C_Vmin)
+println("maxC_num = ", maxC_num)
+println("maxC_const = ", maxC_const)
+println("maxC_Vmax = ", maxC_Vmax)
+println("maxC_Vmin = ", maxC_Vmin)
+
+println("Times when Vmax is used in numerical optimal control:")
+println(times_Vmax)
+
+println("Times when Vmin is used in numerical optimal control:")
+println(times_Vmin)
+
+# Find max C from all controls (numerical optimal and constant)
+
+# Compute maxC_Vmax and maxC_Vmin for summary printout
+maxC_num = maximum(C_num)
+maxC_const = maximum(C_const)
+maxC_Vmax = maximum(C_Vmax)
+maxC_Vmin = maximum(C_Vmin)
+
+println("Max concentration C (Numerical Optimal Control): ", maxC_num)
+println("Max concentration C (Constant Control): ", maxC_const)
+
+using RecipesBase
+
+function v_control_markers!(p, times_Vmax, times_Vmin)
+    for t in times_Vmax
+        vline!(p, [t], line=:dash, color=:red, label=false)
+    end
+    for t in times_Vmin
+        vline!(p, [t], line=:dot, color=:blue, label=false)
+    end
+end
+
+v_control_markers!(p2, times_Vmax, times_Vmin)
+
+# Constant control at Vmax
+
+# Already defined above, skip duplicate definitions
+
+# Constant control at Vmin
+
+# Already defined above, skip duplicate definitions
+
+plot(tsteps, C_num, label="Numerical Optimal V(t)", lw=2)
+plot!(tsteps, C_const, label="Constant V(t) = $(round((Vmin+Vmax)/2, digits=2))", lw=2, ls=:dot)
+plot!(tsteps, C_Vmax, label="Constant V(t) = Vmax = $Vmax", lw=2, ls=:dashdot)
+plot!(tsteps, C_Vmin, label="Constant V(t) = Vmin = $Vmin", lw=2, ls=:dashdot)
+xlabel!("Time")
+ylabel!("Concentration C")
+title!("Comparison of C concentration under different controls")
+
+
+println("\n======================")
+println("Summary of Max C for Each Control Strategy")
+println("======================")
+println("Numerical Optimal V(t):      ", round(maxC_num, digits=4))
+println("Constant V(t) = ", round((Vmin + Vmax)/2, digits=4), ":       ", round(maxC_const, digits=4))
+println("Constant V(t) = Vmax = ", Vmax, ":    ", round(maxC_Vmax, digits=4))
+println("Constant V(t) = Vmin = ", Vmin, ":    ", round(maxC_Vmin, digits=4))
+println("======================\n")
+
+
+
+
+
+############################################################
+# Monte Carlo search using PMP optimizer
+# Metric: maximum C(t)
+############################################################
+function monte_carlo_PMP_maxC(n_trials=20)
+    successes = []
+
+    function random_parameters_PMP()
+    k1 = 10^(rand(-1.0:0.05:1.0))   # range ~0.1–10
+    k2 = 10^(rand(-1.0:0.05:1.0))
+    k3 = 10^(rand(-1.0:0.05:1.0))
+    D  = 10^(rand(0.0:0.05:2.0))    # inhibitor level
+    Kd = 10^(rand(-1.0:0.05:1.0))   # inhibition strength
+    return k1, k2, k3, D, Kd
+end
+
+    for trial in 1:n_trials
+        println("\n🧪 Trial $trial / $n_trials")
+
+        # Sample random parameters
+        k1, k2, k3, D_trial, Kd_trial = random_parameters_PMP()
+
+        # Update globals used in rate laws
+        global k1 = k1
+        global k2 = k2
+        global k3 = k3
+        global D  = D_trial
+        global Kd = Kd_trial
+
+        try
+            # PMP optimal control
+            sol_opt, _, _ =
+                forward_backward_sweep(n0, λT, tspan, tsteps)
+
+            # Constant controls
+            sol_Vmax, _, _ =
+                forward_backward_sweep(n0, λT, tspan, tsteps;
+                                       control_update=Returns(Vmax))
+
+            sol_Vmin, _, _ =
+                forward_backward_sweep(n0, λT, tspan, tsteps;
+                                       control_update=Returns(Vmin))
+
+            sol_Vmean, _, _ =
+                forward_backward_sweep(n0, λT, tspan, tsteps;
+                                       control_update=Returns((Vmin+Vmax)/2))
+
+            # Metric: maximum C(t)
+            Copt  = maximum([sol_opt(t)[3]  for t in tsteps])
+            Cmax  = maximum([sol_Vmax(t)[3] for t in tsteps])
+            Cmin  = maximum([sol_Vmin(t)[3] for t in tsteps])
+            Cmean = maximum([sol_Vmean(t)[3] for t in tsteps])
+
+            # Record only if PMP dominates all constants
+            if Copt > Cmax && Copt > Cmin && Copt > Cmean
+                println("✅ SUCCESS: PMP gives largest C")
+                push!(successes, (
+                    params = (k1, k2, k3, D_trial, Kd_trial),
+                    Copt   = Copt,
+                    Cmax   = Cmax,
+                    Cmin   = Cmin,
+                    Cmean  = Cmean
+                ))
+            else
+                println("⚪ No dominance")
+            end
+
+        catch e
+            println("❌ Failed trial: ", e)
+        end
+    end
+
+    return successes
+end
+
+
+
+Random.seed!(11)
+successes_maxC = monte_carlo_PMP_maxC(15)
+
+println("\n=== SUMMARY ===")
+println("Found $(length(successes_maxC)) winning parameter sets")
+for s in successes_maxC
+    println(s)
+end
+############################################################
+
+
+############################
+# THREE-PANEL SUMMARY PLOT #
+############################
+
+A_opt = [sols.opt(t)[1] for t in tsteps]
+B_opt = [sols.opt(t)[2] for t in tsteps]
+C_opt = [sols.opt(t)[3] for t in tsteps]
+
+C_Vmin  = [sols.min(t)[3]  for t in tsteps]
+C_Vmax  = [sols.max(t)[3]  for t in tsteps]
+C_Vmean = [sols.mean(t)[3] for t in tsteps]
+
+plt = plot(layout = @layout([a; b; c]), size=(900,900))
+
+# --- Top: Vopt(t)
+plot!(
+    plt[1],
+    tsteps, V_vals,
+    lw=2,
+    label="Vopt(t)"
+)
+ylabel!(plt[1], "Volume V(t)")
+title!(plt[1], "Optimal Control")
+
+# --- Middle: Species under Vopt
+plot!(
+    plt[2],
+    tsteps, A_opt,
+    lw=2,
+    label="A(t)"
+)
+plot!(
+    plt[2],
+    tsteps, B_opt,
+    lw=2,
+    label="B(t)"
+)
+plot!(
+    plt[2],
+    tsteps, C_opt,
+    lw=2,
+    label="C(t)"
+)
+ylabel!(plt[2], "Number of Molecules")
+title!(plt[2], "Species Dynamics under Optimal Control")
+
+# --- Bottom: C(t) comparison
+plot!(
+    plt[3],
+    tsteps, C_opt,
+    lw=3,
+    label="C(t) – Vopt"
+)
+plot!(
+    plt[3],
+    tsteps, C_Vmin,
+    lw=2,
+    ls=:dot,
+    label="C(t) – Vmin"
+)
+plot!(
+    plt[3],
+    tsteps, C_Vmax,
+    lw=2,
+    ls=:dash,
+    label="C(t) – Vmax"
+)
+plot!(
+    plt[3],
+    tsteps, C_Vmean,
+    lw=2,
+    ls=:dashdot,
+    label="C(t) – Vmean"
+)
+
+xlabel!(plt[3], "Time")
+ylabel!(plt[3], "Number of C")
+title!(plt[3], "C(t) Comparison Across Controls")
+
+display(plt)
+
+
+
+# --- Panel labels ---
+annotate!(
+    plt[1],
+    (tsteps[1], 115, text("(a)", 18, :black, :left))
+)
+
+annotate!(
+    plt[2],
+    (tsteps[1], 240, text("(b)", 18, :black, :left))
+)
+
+annotate!(
+    plt[3],
+    (tsteps[1], 50, text("(c)", 18, :black, :left))
+)
+
+############################################################
+
+savefig(plt, "linear_model_graphs.png")
+
+
+
+
+
+############################
+# THREE-PANEL SUMMARY PLOT #
+############################
+
+using Plots
+
+# Extract trajectories
+A_opt = [sols.opt(t)[1] for t in tsteps]
+B_opt = [sols.opt(t)[2] for t in tsteps]
+C_opt = [sols.opt(t)[3] for t in tsteps]
+
+C_Vmin  = [sols.min(t)[3]  for t in tsteps]
+C_Vmax  = [sols.max(t)[3]  for t in tsteps]
+C_Vmean = [sols.mean(t)[3] for t in tsteps]
+
+# ---- Global plot defaults for paper look
+default(
+    fontfamily="Helvetica",
+    linewidth=2,
+    framestyle=:box,
+    legendfontsize=9,
+    guidefontsize=10,
+    tickfontsize=9,
+    titlefontsize=11
+)
+
+# Build layout (share x axis visually by hiding xticks on upper panels)
+plt = plot(layout = @layout([a; b; c]), size=(900, 900), margin=6Plots.mm)
+
+# -----------------------------
+# (a) Top: Vopt(t)
+# -----------------------------
+plot!(
+    plt[1],
+    tsteps, V_vals,
+    lw=2.5,
+    label="Vopt(t)"
+)
+ylabel!(plt[1], "Volume V(t)")
+title!(plt[1], "Optimal volume trajectory")
+xticks!(plt[1], false)
+
+# Add panel label (a)
+annotate!(plt[1], (tsteps[1], maximum(V_vals), text("(a)", 12, :black, :left)))
+
+# -----------------------------
+# (b) Middle: species under Vopt
+# -----------------------------
+plot!(
+    plt[2],
+    tsteps, A_opt,
+    lw=2,
+    label="A(t)"
+)
+plot!(
+    plt[2],
+    tsteps, B_opt,
+    lw=2,
+    label="B(t)"
+)
+plot!(
+    plt[2],
+    tsteps, C_opt,
+    lw=2.5,
+    label="C(t)"
+)
+ylabel!(plt[2], "Molecules (n)")
+title!(plt[2], "Species dynamics under optimal control")
+xticks!(plt[2], false)
+legend!(plt[2], :right)
+
+# Add panel label (b)
+annotate!(plt[2], (tsteps[1], maximum([maximum(A_opt), maximum(B_opt), maximum(C_opt)]),
+                   text("(b)", 12, :black, :left)))
+
+# -----------------------------
+# (c) Bottom: C(t) comparison
+# -----------------------------
+plot!(
+    plt[3],
+    tsteps, C_opt,
+    lw=3,
+    label="Vopt"
+)
+plot!(
+    plt[3],
+    tsteps, C_Vmin,
+    lw=2,
+    ls=:dot,
+    label="Vmin"
+)
+plot!(
+    plt[3],
+    tsteps, C_Vmax,
+    lw=2,
+    ls=:dash,
+    label="Vmax"
+)
+plot!(
+    plt[3],
+    tsteps, C_Vmean,
+    lw=2,
+    ls=:dashdot,
+    label="Vmean"
+)
+
+xlabel!(plt[3], "Time")
+ylabel!(plt[3], "C molecules (n_C)")
+title!(plt[3], "Product comparison across volume controls")
+legend!(plt[3], :right)
+
+# Add panel label (c)
+annotate!(plt[3], (tsteps[1], maximum([maximum(C_opt), maximum(C_Vmin), maximum(C_Vmax), maximum(C_Vmean)]),
+                   text("(c)", 12, :black, :left)))
+
+display(plt)
+
+# Save figure (PNG for quick view, PDF for paper)
+savefig(plt, "Figure1_linear_three_panel.png")
+savefig(plt, "Figure1_linear_three_panel.pdf")
+
+
+using Pkg
+Pkg.activate(".")
+
+using DifferentialEquations, Optim, Random, Plots, Statistics, ForwardDiff
+
+# =========================
+# PARAMETERS
+# =========================
+k1, k2, k3, D, Kd = 0.7943282347242815, 5.011872336272722, 4.466835921509632, 7.079457843841379, 0.28183829312644537
+Vmin, Vmax = 1.0, 100.0
+ϵ = 1e-8  # small value to avoid division by zero
+
+# =========================
+# RATE LAWS (molecule-number form)
+# =========================
+rate1(A, C, V) = V * k1 * (A / (V + ϵ))  # simplifies to k1*A but keep your structure
+rate2(B, V, D) = V * k2 * (B / (V + ϵ)) / (1 + (D / (V + ϵ)) / Kd)
+rate3(C, V)    = V * k3 * (C / (V + ϵ))
+
+# =========================
+# STATE DYNAMICS: n = [A,B,C]
+# =========================
+function state_dynamics!(du, n, p, t, λ, V, D)
+    A, B, C = n
+    r1 = rate1(A, C, V)
+    r2 = rate2(B, V, D)
+    r3 = rate3(C, V)
+    du[1] = -r1
+    du[2] =  r1 - r2
+    du[3] =  r2 - r3
+end
+
+# =========================
+# HAMILTONIAN
+# =========================
+function H(n, λ, V, D)
+    A, B, C = n
+    L1, L2, L3 = λ
+    r1 = rate1(A, C, V)
+    r2 = rate2(B, V, D)
+    r3 = rate3(C, V)
+    return L1 * (-r1) + L2 * (r1 - r2) + L3 * (r2 - r3)
+end
+
+# =========================
+# ADJOINT DYNAMICS
+# =========================
+function adjoint_dynamics!(dl, λ, n, V, D)
+    dl .= -ForwardDiff.gradient(nn -> H(nn, λ, V, D), n)
+end
+
+# =========================
+# OPTIMAL CONTROL: argmax_V H
+# =========================
+function optimal_V(n, λ)
+    obj(V) = -H(n, λ, V, D)  # minimize -H = maximize H
+    res = optimize(obj, Vmin, Vmax, Brent())
+    Vopt = Optim.minimizer(res)
+    return clamp(Vopt, Vmin, Vmax)
+end
+
+# =========================
+# FORWARD-BACKWARD SWEEP
+# =========================
+function forward_backward_sweep(n0, λT, tspan, tsteps; control_update=optimal_V, iters=50)
+    V_vals = fill((Vmin + Vmax) / 2, length(tsteps))
+    sol_n, sol_λ = nothing, nothing
+
+    for sweep in 1:iters
+        println("Sweep $sweep")
+
+        λ_dummy = zeros(3)
+
+        # forward solve
+        function forward_ode!(du, u, p, t)
+            idx = findfirst(x -> x ≥ t, tsteps)
+            state_dynamics!(du, u, p, t, λ_dummy, V_vals[idx], D)
+        end
+        prob_fwd = ODEProblem(forward_ode!, n0, tspan)
+        sol_n = solve(prob_fwd, Tsit5(), saveat=tsteps)
+
+        # backward solve
+        function backward_ode!(dl, l, p, t)
+            idx = findfirst(x -> x ≥ t, tsteps)
+            adjoint_dynamics!(dl, l, sol_n(t), V_vals[idx], D)
+        end
+        prob_bwd = ODEProblem(backward_ode!, λT, (tspan[2], tspan[1]))
+        sol_λ = solve(prob_bwd, Tsit5(), saveat=reverse(tsteps))
+
+        # update control
+        for (i, t) in enumerate(tsteps)
+            V_vals[i] = control_update(sol_n(t), sol_λ(t))
+        end
+    end
+
+    return sol_n, sol_λ, V_vals
+end
+
+# =========================
+# GENERATE SOLUTIONS (AND KEEP Vopt CONSISTENT)
+# =========================
+function generate_solutions(n0, λT, tspan, tsteps)
+    sol_opt, _, Vopt = forward_backward_sweep(n0, λT, tspan, tsteps)
+
+    sol_Vmax, _, _  = forward_backward_sweep(n0, λT, tspan, tsteps; control_update=Returns(Vmax))
+    sol_Vmin, _, _  = forward_backward_sweep(n0, λT, tspan, tsteps; control_update=Returns(Vmin))
+    sol_Vmean, _, _ = forward_backward_sweep(n0, λT, tspan, tsteps; control_update=Returns((Vmin + Vmax) / 2))
+
+    return (; opt=sol_opt, max=sol_Vmax, min=sol_Vmin, mean=sol_Vmean, Vopt=Vopt)
+end
+
+# =========================
+# MAIN RUN
+# =========================
+n0 = [200.0, 0.0, 0.0]
+λT = [0.0, 0.0, 1.0]
+tspan = (0.0, 4.0)
+tsteps = range(tspan[1], tspan[2], length=300)
+
+sols = generate_solutions(n0, λT, tspan, tsteps)
+
+# Extract trajectories
+A_opt  = [sols.opt(t)[1] for t in tsteps]
+B_opt  = [sols.opt(t)[2] for t in tsteps]
+C_opt  = [sols.opt(t)[3] for t in tsteps]
+
+C_Vmax  = [sols.max(t)[3]  for t in tsteps]
+C_Vmin  = [sols.min(t)[3]  for t in tsteps]
+C_Vmean = [sols.mean(t)[3] for t in tsteps]
+
+V_vals = sols.Vopt
+
+# Define these ONCE so they never error
+V_num   = V_vals
+C_num   = C_opt
+C_const = C_Vmean
+
+println("\nMax C (Vopt):  ", maximum(C_opt))
+println("Max C (Vmax):  ", maximum(C_Vmax))
+println("Max C (Vmin):  ", maximum(C_Vmin))
+println("Max C (Vmean): ", maximum(C_Vmean))
+
+# =========================
+# Detect Vmin/Vmax times
+# =========================
+times_Vmax = [tsteps[i] for i in eachindex(V_num) if isapprox(V_num[i], Vmax; atol=1e-4)]
+times_Vmin = [tsteps[i] for i in eachindex(V_num) if isapprox(V_num[i], Vmin; atol=1e-4)]
+
+println("\nTimes when Vmax used: ", times_Vmax)
+println("Times when Vmin used: ", times_Vmin)
+
+# =========================
+# 3-PANEL FIGURE (a)(b)(c)
+# =========================
+default(
+    fontfamily="Helvetica",
+    linewidth=2,
+    framestyle=:box,
+    legendfontsize=9,
+    guidefontsize=10,
+    tickfontsize=9,
+    titlefontsize=11
+)
+
+plt = plot(layout=@layout([a; b; c]), size=(900,900), margin=6Plots.mm)
+
+xmin = first(tsteps)
+ymax2=240
+ymax1=120
+# -----------------
+# (A) Vopt
+# -----------------
+plot!(plt[1], tsteps, V_vals, lw=2.5, label="Vopt(t)")
+ylabel!(plt[1], "Volume V(t)")
+title!(plt[1], "Optimal volume trajectory")
+
+
+
+# -----------------
+# (B) Species under Vopt
+# -----------------
+plot!(plt[2], tsteps, A_opt, lw=2,   label="A(t)")
+plot!(plt[2], tsteps, B_opt, lw=2,   label="B(t)")
+plot!(plt[2], tsteps, C_opt, lw=2.5, label="C(t)")
+ylabel!(plt[2], "Molecules")
+title!(plt[2], "Species dynamics under optimal control")
+ymin2 = minimum([minimum(A_opt), minimum(B_opt), minimum(C_opt)])
+annotate!(plt[2],
+    (xmin,
+     ymax2 - 0.03*(ymax2 - ymin2),
+     text("(b)", 18, :black, :left))
+)
+ymax2=240
+# -----------------
+# (C) C comparison
+# -----------------
+plot!(plt[3], tsteps, C_opt,   lw=3, label="Vopt")
+plot!(plt[3], tsteps, C_Vmin,  lw=2, ls=:dot,     label="Vmin")
+plot!(plt[3], tsteps, C_Vmax,  lw=2, ls=:dash,    label="Vmax")
+plot!(plt[3], tsteps, C_Vmean, lw=2, ls=:dashdot, label="Vmean")
+xlabel!(plt[3], "Time")
+ylabel!(plt[3], "C molecules")
+title!(plt[3], "Product comparison across volume controls")
+legend!(plt[3], :right)
+ymax3=50
+ymin3 = minimum([minimum(C_opt), minimum(C_Vmin), minimum(C_Vmax), minimum(C_Vmean)])
+annotate!(plt[3],
+    (xmin,
+     ymax3 - 0.03*(ymax3 - ymin3),
+     text("(c)", 18, :black, :left))
+)
+
+display(plt)
+savefig(plt, "Figure1_linear_three_panel.png")
+savefig(plt, "Figure1_linear_three_panel.pdf")
+
+
+
+# =========================
+# OPTIONAL: Plot C curves + markers (no p2 undefined)
+# =========================
+p2 = plot(tsteps, C_num,   label="Numerical Optimal V(t)", lw=2)
+plot!(p2, tsteps, C_const, label="Constant Vmean", lw=2, ls=:dot)
+plot!(p2, tsteps, C_Vmax,  label="Constant Vmax",  lw=2, ls=:dash)
+plot!(p2, tsteps, C_Vmin,  label="Constant Vmin",  lw=2, ls=:dashdot)
+
+# Add vertical lines where V hits bounds (optional visual)
+for t in times_Vmax
+    vline!(p2, [t], line=:dash, label=false)
+end
+for t in times_Vmin
+    vline!(p2, [t], line=:dot, label=false)
+end
+
+xlabel!(p2, "Time")
+ylabel!(p2, "C molecules (n_C)")
+title!(p2, "C(t) under different controls (with bound-switch times)")
+display(p2)
+
+savefig(p2, "C_comparison_with_switch_times.png")
+savefig(p2, "C_comparison_with_switch_times.pdf")
+
+# =========================
+# OPTIONAL: Monte Carlo search (kept, but won’t break your main figure)
+# =========================
+function monte_carlo_PMP_maxC(n_trials=15)
+    successes = []
+
+    function random_parameters_PMP()
+        k1 = 10^(rand(-1.0:0.05:1.0))
+        k2 = 10^(rand(-1.0:0.05:1.0))
+        k3 = 10^(rand(-1.0:0.05:1.0))
+        D  = 10^(rand(0.0:0.05:2.0))
+        Kd = 10^(rand(-1.0:0.05:1.0))
+        return k1, k2, k3, D, Kd
+    end
+
+    for trial in 1:n_trials
+        println("\n🧪 Trial $trial / $n_trials")
+
+        k1r, k2r, k3r, Dr, Kdr = random_parameters_PMP()
+
+        global k1 = k1r
+        global k2 = k2r
+        global k3 = k3r
+        global D  = Dr
+        global Kd = Kdr
+
+        try
+            sol_opt, _, _  = forward_backward_sweep(n0, λT, tspan, tsteps)
+            sol_Vmax, _, _ = forward_backward_sweep(n0, λT, tspan, tsteps; control_update=Returns(Vmax))
+            sol_Vmin, _, _ = forward_backward_sweep(n0, λT, tspan, tsteps; control_update=Returns(Vmin))
+            sol_Vmean, _, _= forward_backward_sweep(n0, λT, tspan, tsteps; control_update=Returns((Vmin+Vmax)/2))
+
+            Copt  = maximum([sol_opt(t)[3]   for t in tsteps])
+            Cmax  = maximum([sol_Vmax(t)[3]  for t in tsteps])
+            Cmin  = maximum([sol_Vmin(t)[3]  for t in tsteps])
+            Cmean = maximum([sol_Vmean(t)[3] for t in tsteps])
+
+            if Copt > Cmax && Copt > Cmin && Copt > Cmean
+                println("✅ SUCCESS: PMP gives largest C")
+                push!(successes, (params=(k1r,k2r,k3r,Dr,Kdr), Copt=Copt, Cmax=Cmax, Cmin=Cmin, Cmean=Cmean))
+            else
+                println("⚪ No dominance")
+            end
+        catch e
+            println("❌ Failed trial: ", e)
+        end
+    end
+
+    return successes
+end
+
+# Uncomment if you want it to run every time:
+# Random.seed!(11)
+# successes_maxC = monte_carlo_PMP_maxC(15)
+# println("\n=== SUMMARY ===")
+# println("Found $(length(successes_maxC)) winning parameter sets")
+# for s in successes_maxC
+#     println(s)
+# end
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+############################################################
+# FIG 1(c) REPLACEMENT (UPDATED PER PI):
+# Curve = constant-V forward simulations
+# Segments = Vopt (PMP) maxC with bounds [Vmin, Vhi],
+#            where Vhi = Vmax, Vmax-10, Vmax-20, ..., Vmin
+# No legend, and each horizontal line only spans its bound region
+############################################################
+
+using DifferentialEquations, Optim, Plots, Statistics
+
+# ----------------------------------------------------------
+# Constant V forward simulation (matches your forward_ode! idea)
+# ----------------------------------------------------------
+function solve_forward_constantV(Vconst, n0, tspan, tsteps; D=D)
+    λ_dummy = zeros(3)  # unused by state_dynamics!, but keep signature identical
+    function forward_ode!(du, u, p, t)
+        state_dynamics!(du, u, p, t, λ_dummy, Vconst, D)
+    end
+    prob = ODEProblem(forward_ode!, n0, tspan)
+    sol  = solve(prob, Tsit5(), saveat=tsteps)
+    return sol
+end
+
+function maxC_constantV_like_main(Vconst, n0, tspan, tsteps; D=D)
+    sol = solve_forward_constantV(Vconst, n0, tspan, tsteps; D=D)
+    return maximum(sol[3, :])
+end
+
+# ----------------------------------------------------------
+# Vopt maxC with bounds [Vlo, Vhi] (PMP via forward_backward_sweep)
+# ----------------------------------------------------------
+function maxC_Vopt_with_bounds(Vlo, Vhi, n0, λT, tspan, tsteps; iters=100)
+    oldVmin = Vmin
+    oldVmax = Vmax
+    try
+        global Vmin = Vlo
+        global Vmax = Vhi
+
+        sol_opt, _, _ = forward_backward_sweep(
+            n0, λT, tspan, tsteps;
+            control_update = optimal_V,
+            iters = iters
+        )
+        Cvals = [sol_opt(t)[3] for t in tsteps]
+        return maximum(Cvals)
+    finally
+        global Vmin = oldVmin
+        global Vmax = oldVmax
+    end
+end
+
+# ----------------------------------------------------------
+# Build updated Fig 1(c)
+# ----------------------------------------------------------
+function plot_constV_curve_plus_Vopt_segments(n0, λT, tspan, tsteps;
+                                              ngrid=150,
+                                              iters_opt=100,
+                                              step=10.0,
+                                              savebase="Figure1c_constVcurve_plus_VoptSegments")
+
+    Vlo = Vmin
+    Vhi = Vmax
+
+    # Constant-V sweep (forward simulations)
+    Vs = collect(range(Vlo, Vhi, length=ngrid))
+    Cs = similar(Vs, Float64)
+
+    @info "Computing constant-V curve via forward simulations" ngrid
+    for (i, V) in enumerate(Vs)
+        Cs[i] = maxC_constantV_like_main(V, n0, tspan, tsteps; D=D)
+    end
+
+    # Plot base curve (no legend)
+    default(fontfamily="Helvetica", framestyle=:box, linewidth=2,
+            guidefontsize=10, tickfontsize=9, titlefontsize=11)
+
+    p = plot(
+        Vs, Cs,
+        lw=2.5,
+        label=false,
+        xlabel="Volume V (constant)",
+        ylabel="maxₜ C(t)",
+        title="Stationary volume performance + Vopt bound benchmarks",
+        legend=false
+    )
+
+    # Vopt horizontal segments: [Vmin, Vhi], where Vhi = Vmax, Vmax-step, ..., Vmin
+    Vhis = collect(Vhi:-step:Vlo)
+    if last(Vhis) != Vlo
+        push!(Vhis, Vlo)  # ensure we end exactly at Vmin
+    end
+
+    @info "Computing Vopt segments (PMP forward-backward sweep)" length(Vhis) iters_opt step
+
+    seg_vals = Vector{Tuple{Float64,Float64}}()  # (Vhi, Copt)
+    for Vtop in Vhis
+        Copt = maxC_Vopt_with_bounds(Vlo, Vtop, n0, λT, tspan, tsteps; iters=iters_opt)
+        push!(seg_vals, (Vtop, Copt))
+
+        # horizontal segment from x=Vmin to x=Vtop at y=Copt
+plot!(
+    p,
+    [Vlo, Vtop], [Copt, Copt],
+    lw=2.2,
+    color=:orange,
+    label=false
+)
+
+    end
+
+    display(p)
+    savefig(p, savebase * ".png")
+    savefig(p, savebase * ".pdf")
+
+    println("\n=== Vopt segment values (bounds [Vmin, Vhi]) ===")
+    for (Vtop, Copt) in seg_vals
+        println("[", Vlo, ", ", Vtop, "]  maxC = ", Copt)
+    end
+
+    return p, (Vs=Vs, Cs=Cs, segments=seg_vals)
+end
+
+# ----------------------------------------------------------
+# CALL IT (after n0, λT, tspan, tsteps are defined)
+# ----------------------------------------------------------
+p_fig, results_fig = plot_constV_curve_plus_Vopt_segments(
+    n0, λT, tspan, tsteps;
+    ngrid=150,
+    iters_opt=100,
+    step=10.0,
+    savebase="Figure1c_constVcurve_plus_VoptSegments"
+)
+
+
+savefig(p_fig, "ABCexample.png")

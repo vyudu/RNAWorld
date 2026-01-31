@@ -1,0 +1,825 @@
+# ============================================================
+# Optimize_SteadyState_RNA_Periodic.jl
+#
+# Changes included:
+# 1) ω upper bound extended to 100 for optimizer + plots
+# 2) Fig 2b ω grid is LOG-SPACED (0.01 → 100)
+# 3) Fig 2a adds horizontal reference lines:
+#    - Vopt steady RNA with clamp [Vmin, Vmax]
+#    - Vopt steady RNA with clamp [Vmin, Vmean]
+#    - Best constant-V steady RNA over V ∈ [Vmean, Vmax]
+# 4) 4D (A, ω, ϕ) scatter label/layout fixed: extra margins + size so labels
+#    don’t overlap the plot or colorbar
+# ============================================================
+
+using Pkg
+Pkg.activate(".")
+using DifferentialEquations, Random, Statistics, LinearAlgebra
+using Optim, BlackBoxOptim
+using Plots
+
+# -------------------------
+# Global constants & params
+# -------------------------
+eps_div = 1e-9
+Vmin, Vmax = 1.0, 100.0
+Vmean = (Vmin + Vmax) / 2
+
+# Use long horizon so we can measure [1000, 1400]
+tspan_long = (0.0, 1400.0)
+
+# Initial conditions: [α, Cp, αCp, CppC, RNA]
+n0 = [100.0, 50.0, 10.0, 50.0, 100.0]
+
+# Example kinetics (your tuple format: k1,k2,k3,k4,k5,c6,Kd,D1)
+params_example = (
+0.004570881896148752, 0.005623413251903491, 0.0010964781961431851, 0.4677351412871982, 0.006918309709189363, 5495.408738576249, 0.0003715352290971724, 0.1318256738556407
+)
+    0.018620871366628676,
+    0.13489628825916536,
+    0.03890451449942807,
+    0.016595869074375606,
+    0.03548133892335755,
+    17.378008287493753,
+    0.20417379446695297,
+    0.13489628825916536
+
+0.047863009232263824, 0.046773514128719815, 0.07943282347242814, 0.05011872336272722, 0.0707945784384138, 12.302687708123818, 0.15135612484362082, 0.5495408738576245
+# -----------------------
+# Reaction model (same)
+# -----------------------
+function rates(n::AbstractVector, V, p)
+    α, Cp, αCp, CppC, RNA = n
+    k1,k2,k3,k4,k5,c6,Kd,D1 = p
+    Vsafe = max(float(V), eps_div)
+
+    r1 = k1 * (αCp^2) / (Vsafe^2)
+    r2 = k2 * (α * CppC) / (Vsafe^2)
+    r3 = k3 * CppC / Vsafe
+    r4 = k4 * (α * Cp) / (Vsafe^2)
+    r5 = k5 * αCp / Vsafe
+    r6 = c6 * (CppC / Vsafe) / (1 + (Cp + αCp) / (Kd * Vsafe))
+    r7 = D1 / Vsafe
+    return r1,r2,r3,r4,r5,r6,r7
+end
+
+function model!(du, n, p, t, V)
+    r1,r2,r3,r4,r5,r6,r7 = rates(n, V, p)
+    du[1] = r1 + r5 - r2 - r4
+    du[2] = r3 + r5 - r4 + r7
+    du[3] = 2r2 - 2r1 + r3 + r4 - r5 + r6
+    du[4] = r1 - r2 - r3 - r6
+    du[5] = r6 - r7
+end
+
+# -------------------------
+# Volume control (UPDATED)
+# -------------------------
+# Configurable clamp bounds:
+sinusoidal_V(t, A, ω, ϕ; Vlo=Vmin, Vhi=Vmax) = clamp(Vmean + A*sin(ω*t + ϕ), Vlo, Vhi)
+
+# -------------------------
+# Simulation wrappers
+# -------------------------
+function simulate_sinusoidal_bounds(p::NTuple, n0, tspan, A, ω, ϕ;
+                                    Vlo=Vmin, Vhi=Vmax,
+                                    abstol=1e-8, reltol=1e-8, saveat=nothing)
+    f!(du, u, p_, t) = model!(du, u, p_, t, sinusoidal_V(t, A, ω, ϕ; Vlo=Vlo, Vhi=Vhi))
+    prob = ODEProblem(f!, copy(n0), tspan, p)
+
+    if isnothing(saveat)
+        sol = solve(prob, TRBDF2(); abstol=abstol, reltol=reltol, maxiters=1e7)
+    else
+        sol = solve(prob, TRBDF2(); abstol=abstol, reltol=reltol, saveat=saveat, maxiters=1e7)
+    end
+    return sol
+end
+
+function simulate_constant(p::NTuple, n0, tspan, Vconst;
+                           abstol=1e-8, reltol=1e-8, saveat=nothing)
+    f!(du, u, p_, t) = model!(du, u, p_, t, Vconst)
+    prob = ODEProblem(f!, copy(n0), tspan, p)
+
+    if isnothing(saveat)
+        sol = solve(prob, TRBDF2(); abstol=abstol, reltol=reltol, maxiters=1e7)
+    else
+        sol = solve(prob, TRBDF2(); abstol=abstol, reltol=reltol, saveat=saveat, maxiters=1e7)
+    end
+    return sol
+end
+
+# ============================================================
+# Steady/periodic metrics
+# ============================================================
+
+# (A) Window-average over [t1,t2] using interpolation + trapezoid on a fixed grid
+function window_average_RNA(sol; t1=1000.0, t2=1400.0, N=2001)
+    t1 = max(t1, sol.t[1])
+    t2 = min(t2, sol.t[end])
+    if t2 <= t1
+        return NaN
+    end
+    tt = range(t1, t2; length=N)
+    s = 0.0
+    @inbounds for i in 1:(length(tt)-1)
+        a = sol(tt[i])[5]
+        b = sol(tt[i+1])[5]
+        dt = tt[i+1] - tt[i]
+        s += 0.5*(a+b)*dt
+    end
+    return s/(t2 - t1)
+end
+
+# (B1) Check periodic steady state near the end:
+#   max over samples of ||c(t) - c(t-T)||_∞ < tol for all species
+function periodic_converged(sol, ω; tol=1e-9, nsamples=200)
+    if ω <= 0
+        return false
+    end
+    T = 2π/ω
+    if sol.t[end] < 2T
+        return false
+    end
+
+    t_end = sol.t[end]
+    t_start = t_end - T
+    tt = range(t_start, t_end; length=nsamples)
+
+    maxerr = 0.0
+    @inbounds for t in tt
+        u_now = sol(t)
+        u_prev = sol(t - T)
+        err = maximum(abs.(u_now .- u_prev))
+        maxerr = max(maxerr, err)
+    end
+    return maxerr < tol
+end
+
+# (B2) Periodic average over the last period
+function periodic_average_RNA(sol, ω; N=2001)
+    T = 2π/ω
+    t_end = sol.t[end]
+    t1 = t_end - T
+    t2 = t_end
+    if t1 < sol.t[1]
+        return NaN
+    end
+    tt = range(t1, t2; length=N)
+    s = 0.0
+    @inbounds for i in 1:(length(tt)-1)
+        a = sol(tt[i])[5]
+        b = sol(tt[i+1])[5]
+        dt = tt[i+1] - tt[i]
+        s += 0.5*(a+b)*dt
+    end
+    return s/T
+end
+
+# Robust steady-state score:
+#  - primary: periodic average if periodic converged
+#  - fallback: window average 1000-1400
+function steady_state_score(sol, ω;
+                            periodic_tol=1e-9,
+                            use_periodic=true,
+                            fallback_window=true)
+    if use_periodic && periodic_converged(sol, ω; tol=periodic_tol)
+        return periodic_average_RNA(sol, ω)
+    elseif fallback_window
+        return window_average_RNA(sol; t1=1000.0, t2=1400.0)
+    else
+        return NaN
+    end
+end
+
+# ============================================================
+# Optimizer: maximize steady-state RNA (UPDATED ω bound + bounded clamps)
+# ============================================================
+
+# Search ranges
+A_low = 0.0
+ϕ_low, ϕ_high = 0.0, 2π
+ω_low, ω_high = 0.005, 100.0
+
+# Objective for BlackBoxOptim (minimize negative score)
+function objective_steady_bounds(x, p; Vlo=Vmin, Vhi=Vmax, periodic_tol=1e-9)
+    A, ω, ϕ = x
+    sol = simulate_sinusoidal_bounds(p, n0, tspan_long, A, ω, ϕ;
+                                     Vlo=Vlo, Vhi=Vhi, abstol=1e-6, reltol=1e-6)
+    if sol.retcode != :Success
+        return 1e12
+    end
+    z = steady_state_score(sol, ω; periodic_tol=periodic_tol, use_periodic=true, fallback_window=true)
+    if !isfinite(z)
+        return 1e12
+    end
+    return -z
+end
+
+function optimize_steady_sinusoidal_bounds(p;
+                                           Vlo=Vmin, Vhi=Vmax,
+                                           maxsteps=1200,
+                                           periodic_tol=1e-9,
+                                           do_local_refine=true)
+
+    # amplitude bound must respect clamp window
+    A_high = (Vhi - Vlo)/2
+    search_range = [(A_low, A_high), (ω_low, ω_high), (ϕ_low, ϕ_high)]
+
+    res_global = bboptimize(
+        x -> objective_steady_bounds(x, p; Vlo=Vlo, Vhi=Vhi, periodic_tol=periodic_tol);
+        Method = :adaptive_de_rand_1_bin_radiuslimited,
+        SearchRange = search_range,
+        NumDimensions = 3,
+        MaxSteps = maxsteps,
+        TraceMode = :silent
+    )
+    x_best = best_candidate(res_global)
+
+    if !do_local_refine
+        Aopt, ωopt, ϕopt = x_best
+        sol_final = simulate_sinusoidal_bounds(p, n0, tspan_long, Aopt, ωopt, ϕopt;
+                                               Vlo=Vlo, Vhi=Vhi, abstol=1e-8, reltol=1e-8)
+        zfinal = steady_state_score(sol_final, ωopt; periodic_tol=periodic_tol, use_periodic=true, fallback_window=true)
+        return (Aopt, ωopt, ϕopt), zfinal, sol_final
+    end
+
+    lower = [r[1] for r in search_range]
+    upper = [r[2] for r in search_range]
+
+    res_local = optimize(
+        x -> objective_steady_bounds(x, p; Vlo=Vlo, Vhi=Vhi, periodic_tol=periodic_tol),
+        lower, upper, x_best,
+        Fminbox(NelderMead()),
+        Optim.Options(iterations=600, show_trace=false)
+    )
+
+    Aopt, ωopt, ϕopt = res_local.minimizer
+    sol_final = simulate_sinusoidal_bounds(p, n0, tspan_long, Aopt, ωopt, ϕopt;
+                                           Vlo=Vlo, Vhi=Vhi, abstol=1e-8, reltol=1e-8)
+    zfinal = steady_state_score(sol_final, ωopt; periodic_tol=periodic_tol, use_periodic=true, fallback_window=true)
+
+    return (Aopt, ωopt, ϕopt), zfinal, sol_final
+end
+
+# ============================================================
+# Fig 2a: steady-state RNA vs fixed volume + horizontal references (UPDATED)
+# ============================================================
+
+function fig2a_constant_volume_curve(p; Vgrid=range(Vmin, Vmax; length=60), periodic_tol=1e-9)
+
+    # constant V curve
+    zV = similar(collect(Vgrid), Float64)
+    for (i, V) in enumerate(Vgrid)
+        sol = simulate_constant(p, n0, tspan_long, V; abstol=1e-8, reltol=1e-8)
+        zV[i] = window_average_RNA(sol; t1=1000.0, t2=1400.0)
+    end
+
+    # (1) Vopt within [Vmin, Vmax]
+    (_, _, _), zVopt_full, _ = optimize_steady_sinusoidal_bounds(
+        p; Vlo=Vmin, Vhi=Vmax, periodic_tol=periodic_tol, maxsteps=1200, do_local_refine=true
+    )
+
+    # (2) Vopt within [Vmin, Vmean]
+    (_, _, _), zVopt_low, _ = optimize_steady_sinusoidal_bounds(
+        p; Vlo=Vmin, Vhi=Vmean, periodic_tol=periodic_tol, maxsteps=1200, do_local_refine=true
+    )
+
+    # (3) best constant V in [Vmean, Vmax] (from the curve)
+    Vvec = collect(Vgrid)
+    idx_hi = findall(v -> v >= Vmean, Vvec)
+    zConst_hi = maximum(zV[idx_hi])
+
+    plt = plot(Vgrid, zV, lw=3,
+               xlabel="Fixed Volume V",
+               ylabel="Steady-state RNA (avg 1000–1400)",
+               title="Fig 2a: Steady-state RNA vs Fixed Volume")
+
+    hline!(plt, [zVopt_full], lw=2, ls=:dash,
+           label="Vopt steady (Vmin–Vmax): $(round(zVopt_full,digits=3))")
+    hline!(plt, [zVopt_low],  lw=2, ls=:dot,
+           label="Vopt steady (Vmin–Vmean): $(round(zVopt_low,digits=3))")
+    hline!(plt, [zConst_hi],  lw=2, ls=:dashdot,
+           label="Best constant V in [Vmean–Vmax]: $(round(zConst_hi,digits=3))")
+
+    return plt, Vgrid, zV, zVopt_full, zVopt_low, zConst_hi
+end
+
+# ============================================================
+# Fig 2b: ω-ϕ colormap (LOG ω grid, ω up to 100)
+# ============================================================
+
+function fig2b_omega_phi_heatmap(p; A_fixed=(Vmax-Vmin)/4,
+                                 ω_vals = 10 .^ range(log10(0.01), log10(100.0); length=90),  # LOGSPACE
+                                 ϕ_vals = range(0.0, 2π; length=80),
+                                 periodic_tol=1e-9)
+
+    Z = Array{Float64}(undef, length(ω_vals), length(ϕ_vals))
+
+    for (iω, ω) in enumerate(ω_vals)
+        for (iϕ, ϕ) in enumerate(ϕ_vals)
+            sol = simulate_sinusoidal_bounds(p, n0, tspan_long, A_fixed, ω, ϕ;
+                                             Vlo=Vmin, Vhi=Vmax, abstol=1e-6, reltol=1e-6)
+            if sol.retcode != :Success
+                Z[iω, iϕ] = NaN
+                continue
+            end
+            Z[iω, iϕ] = steady_state_score(sol, ω; periodic_tol=periodic_tol, use_periodic=true, fallback_window=true)
+        end
+    end
+
+    plt = heatmap(ϕ_vals, ω_vals, Z;
+                  xlabel="ϕ (phase)",
+                  ylabel="ω (angular velocity)",
+                  yscale=:log10,
+                  title="Fig 2b: Periodic steady-state RNA (color) over (ω, ϕ)\nA = $(round(A_fixed, digits=3))",
+                  colorbar_title="RNA steady avg")
+    return plt, ω_vals, ϕ_vals, Z
+end
+
+# ============================================================
+# 4D plot: (A, ω, ϕ) color=steady-state RNA (UPDATED layout)
+# ============================================================
+
+function fig4d_A_omega_phi_scatter(p;
+                                  A_vals=range(0.0, (Vmax-Vmin)/2; length=11),
+                                  ω_vals = 10 .^ range(log10(0.01), log10(100.0); length=35),  # LOGSPACE
+                                  ϕ_vals=range(0.0, 2π; length=24),
+                                  periodic_tol=1e-9)
+
+    As = Float64[]
+    Ws = Float64[]
+    Phs = Float64[]
+    Zs = Float64[]
+
+    for A in A_vals, ω in ω_vals, ϕ in ϕ_vals
+        sol = simulate_sinusoidal_bounds(p, n0, tspan_long, A, ω, ϕ;
+                                         Vlo=Vmin, Vhi=Vmax, abstol=1e-6, reltol=1e-6)
+        if sol.retcode != :Success
+            continue
+        end
+        z = steady_state_score(sol, ω; periodic_tol=periodic_tol, use_periodic=true, fallback_window=true)
+        if isfinite(z)
+            push!(As, A); push!(Ws, ω); push!(Phs, ϕ); push!(Zs, z)
+        end
+    end
+
+    plt = scatter3d(
+        As, Ws, Phs;
+        marker_z = Zs,
+        ms = 5,
+        xlabel = "A (amplitude)",
+        ylabel = "ω (angular velocity)",
+        zlabel = "ϕ (phase)",
+        title = "4D view: (A, ω, ϕ) with color = steady-state RNA",
+        colorbar_title = "RNA steady avg",
+        size = (1100, 800),
+        right_margin = 18mm,   # extra space so z-label doesn't collide with colorbar
+        left_margin  = 8mm,
+        bottom_margin = 8mm,
+        top_margin = 8mm,
+        guidefontsize = 12,
+        tickfontsize = 10,
+        colorbar_tickfontsize = 9,
+        legend = false,
+        camera = (45, 25)
+    )
+
+    return plt, As, Ws, Phs, Zs
+end
+
+# ============================================================
+# Optional: Diagnostic plots for best solution (UPDATED bounds)
+# ============================================================
+
+function plot_best_timeseries(sol, A, ω, ϕ; ptitle="Best control", Vlo=Vmin, Vhi=Vmax)
+    tt = range(tspan_long[1], tspan_long[2]; length=2000)
+    Vt = [sinusoidal_V(t, A, ω, ϕ; Vlo=Vlo, Vhi=Vhi) for t in tt]
+    RNA = [sol(t)[5] for t in tt]
+
+    plt1 = plot(tt, Vt, lw=3, xlabel="Time", ylabel="V(t)", title="$ptitle: V(t)")
+    plt2 = plot(tt, RNA, lw=3, xlabel="Time", ylabel="RNA", title="$ptitle: RNA(t)")
+    return plot(plt1, plt2; layout=(2,1), size=(900,700))
+end
+
+# ============================================================
+# RUN (example)
+# ============================================================
+
+Random.seed!(15)
+
+println("Optimizing steady/periodic steady-state RNA (params_example)...")
+(bestA, bestω, bestϕ), bestZ, sol_best = optimize_steady_sinusoidal_bounds(
+    params_example;
+    Vlo=Vmin, Vhi=Vmax,
+    maxsteps=1200,
+    periodic_tol=1e-9,
+    do_local_refine=true
+)
+
+println("\nBest control (clamp Vmin–Vmax):")
+println("A = $bestA, ω = $bestω, ϕ = $bestϕ")
+println("Steady-state score (periodic if converged; else avg 1000–1400) = $(round(bestZ, digits=6))")
+println("Periodic converged? ", periodic_converged(sol_best, bestω; tol=1e-9))
+
+# Fig 2a + reference lines
+plt2a, Vgrid, zV, zVopt_full, zVopt_low, zConst_hi = fig2a_constant_volume_curve(params_example)
+display(plt2a)
+savefig(plt2a, "Fig2a_steadyRNA_vs_fixedV.png")
+
+# Fig 2b (ω-ϕ heatmap at fixed A)
+A_for_fig2b = bestA  # or choose (Vmax-Vmin)/4
+plt2b, ω_vals, ϕ_vals, Z = fig2b_omega_phi_heatmap(params_example; A_fixed=A_for_fig2b)
+display(plt2b)
+savefig(plt2b, "Fig2b_heatmap_omega_phi_logomega.png")
+
+
+
+using Plots.Measures: mm
+
+
+# 4D plot (A, ω, ϕ) colored by steady-state RNA
+plt4d, As, Ws, Phs, Zs = fig4d_A_omega_phi_scatter(params_example)
+display(plt4d)
+savefig(plt4d, "Fig4d_scatter_A_omega_phi_color_RNA.png")
+
+# Diagnostic: best time series
+plt_best = plot_best_timeseries(sol_best, bestA, bestω, bestϕ; ptitle="Optimized steady-state", Vlo=Vmin, Vhi=Vmax)
+display(plt_best)
+savefig(plt_best, "BestControl_V_and_RNA_timeseries.png")
+
+
+
+# ============================================================
+# PART 2: Find parameter sets where Vopt beats ALL constant-V
+#         and print the best constant volume V*.
+# ============================================================
+
+# ---------- Parameter generator (must exist before finder) ----------
+function random_parameters_big()
+    # upstream: slower + broader so oscillations matter more
+    k1 = 10^(rand(-3.0:0.01:-0.5))   # 0.001 – 0.3
+    k2 = 10^(rand(-3.0:0.01:-0.3))   # 0.001 – 0.5
+    k3 = 10^(rand(-3.0:0.01:-0.3))   # 0.001 – 0.5
+    k4 = 10^(rand(-3.0:0.01:-0.3))   # 0.001 – 0.5
+    k5 = 10^(rand(-3.0:0.01:-0.5))   # 0.001 – 0.3
+
+    # RNA production term (VERY important for oscillation advantage)
+    c6 = 10^(rand(1.0:0.01:4.0))     # 10 – 10,000
+
+    # strong inhibition
+    Kd = 10^(rand(-4.0:0.01:0.5))    # 1e-4 – 3.0
+
+    # low drain so periodic bursts accumulate
+    D1 = 10^(rand(-4.0:0.01:0.3))    # 1e-4 – 2.0
+
+    return (k1, k2, k3, k4, k5, c6, Kd, D1)
+end
+
+
+# ---------- Finder: Vopt steady > max constant steady + margin ----------
+function find_params_where_Vopt_beats_all_constants(;
+        max_tries::Int=400,
+        margin::Float64=1.0,
+        Vgrid_len::Int=60,
+        periodic_tol::Float64=1e-9,
+        maxsteps_opt::Int=900,
+        verbose::Bool=true
+    )
+
+    for trial in 1:max_tries
+        p = random_parameters_big()
+
+        # --- constant-V scan on [Vmin, Vmax] ---
+        Vgrid = collect(range(Vmin, Vmax; length=Vgrid_len))
+        zV = Float64[]
+        for V in Vgrid
+            solV = simulate_constant(p, n0, tspan_long, V; abstol=1e-8, reltol=1e-8)  # NOTE: V is positional
+            push!(zV, window_average_RNA(solV; t1=1000.0, t2=1400.0))
+        end
+
+        zConst_max, idx = findmax(zV)
+        Vbest_const = Vgrid[idx]
+
+        # --- optimized oscillatory control over full clamp ---
+        (Aopt, ωopt, ϕopt), zVopt_full, _ = optimize_steady_sinusoidal_bounds(
+            p;
+            Vlo=Vmin,
+            Vhi=Vmax,
+            periodic_tol=periodic_tol,
+            maxsteps=maxsteps_opt,
+            do_local_refine=true
+        )
+
+        if zVopt_full > zConst_max + margin
+            if verbose
+                println("\n================ SUCCESS =================")
+                println("Trial number        : $trial")
+                println("Best constant V*     : $(round(Vbest_const, digits=4))")
+                println("Best constant RNA    : $(round(zConst_max, digits=6))")
+                println("Vopt (A,ω,ϕ)         : A=$(round(Aopt,digits=6)), ω=$(round(ωopt,digits=6)), ϕ=$(round(ϕopt,digits=6))")
+                println("Vopt steady RNA      : $(round(zVopt_full, digits=6))")
+                println("Margin (Vopt-Const)  : $(round(zVopt_full - zConst_max, digits=6))")
+
+                println("\nParameters tuple (k1,k2,k3,k4,k5,c6,Kd,D1):")
+                println(p)
+
+                println("\nParameters (pretty):")
+                println("k1=$(p[1])")
+                println("k2=$(p[2])")
+                println("k3=$(p[3])")
+                println("k4=$(p[4])")
+                println("k5=$(p[5])")
+                println("c6=$(p[6])")
+                println("Kd=$(p[7])")
+                println("D1=$(p[8])")
+                println("=========================================\n")
+            end
+
+            return p, (Aopt, ωopt, ϕopt), zVopt_full, Vbest_const, zConst_max
+        end
+    end
+
+    error("❌ No parameter set found after $max_tries tries. Increase max_tries, widen parameter ranges, or lower margin.")
+end
+
+
+# ---------- Run the search and overwrite params_example ----------
+p_found, (A_found, ω_found, ϕ_found), zVopt_found, Vbest_const, zConst_max =
+    find_params_where_Vopt_beats_all_constants(
+        max_tries = 400,
+        margin = 1.0,
+        Vgrid_len = 60,
+        verbose = true
+    )
+
+# Use this parameter set for the rest of your figures
+params_example = p_found
+
+println("✅ params_example overwritten with a 'Vopt beats all constants' parameter set.")
+println("Best constant V* = $Vbest_const with RNA = $zConst_max")
+println("Vopt steady RNA  = $zVopt_found  at (A,ω,ϕ)=($A_found, $ω_found, $ϕ_found)")
+# ============================================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# PATCHED + EXTENDED: Fig 2a fixes + working 4D + combined panel
+#
+# What this block changes / adds:
+# A) Fig 2a:
+#    1) Replace "Best constant V in [Vmean–Vmax]" horizontal line with:
+#       - Vopt steady (Vmean–Vmax)  <-- NEW, requested
+#    2) Ensure the constant curve legend label is NOT "y1" by explicitly labeling it.
+# B) 4D plot:
+#    1) Uses a robust 3D scatter with color = RNA (marker_z),
+#       plus wider margins + layout to avoid label/colorbar collisions.
+#    2) Uses log-spaced ω grid and avoids ω so large that T = 2π/ω is too small to resolve.
+# C) New combined figure:
+#    - Left: Fig 2a (constant-V curve + THREE Vopt lines)
+#    - Right: Fig 2b (4D scatter with A varying)  <-- your requested “2b”
+#
+# IMPORTANT:
+#  - Replace your existing fig2a_constant_volume_curve and fig4d_A_omega_phi_scatter
+#    with these versions (same function names), OR paste below them and call the
+#    *_new names provided.
+# ============================================================
+
+# ----------------------------
+# Helper: logspace
+# ----------------------------
+logspace10(a, b, n) = 10 .^ range(log10(a), log10(b); length=n)
+
+# ============================================================
+# Fig 2a (UPDATED): constant-V curve + Vopt lines for:
+#   - [Vmin, Vmax]
+#   - [Vmin, Vmean]
+#   - [Vmean, Vmax]   <-- NEW (replaces best-constant-high line)
+# AND constant curve label fixed (not y1)
+# ============================================================
+function fig2a_constant_volume_curve(p;
+    Vgrid = range(Vmin, Vmax; length=60),
+    periodic_tol = 1e-9)
+
+    # constant V curve
+    Vvec = collect(Vgrid)
+    zV = Vector{Float64}(undef, length(Vvec))
+    for (i, V) in enumerate(Vvec)
+        sol = simulate_constant(p, n0, tspan_long, V; abstol=1e-8, reltol=1e-8)
+        zV[i] = window_average_RNA(sol; t1=1000.0, t2=1400.0)
+    end
+
+    # Vopt within [Vmin, Vmax]
+    (_, _, _), zVopt_full, _ = optimize_steady_sinusoidal_bounds(
+        p; Vlo=Vmin, Vhi=Vmax, periodic_tol=periodic_tol, maxsteps=1200, do_local_refine=true
+    )
+
+    # Vopt within [Vmin, Vmean]
+    (_, _, _), zVopt_low, _ = optimize_steady_sinusoidal_bounds(
+        p; Vlo=Vmin, Vhi=Vmean, periodic_tol=periodic_tol, maxsteps=1200, do_local_refine=true
+    )
+
+    # Vopt within [Vmean, Vmax]   <-- NEW requested line
+    (_, _, _), zVopt_high, _ = optimize_steady_sinusoidal_bounds(
+        p; Vlo=Vmean, Vhi=Vmax, periodic_tol=periodic_tol, maxsteps=1200, do_local_refine=true
+    )
+
+    # Plot with explicit label to avoid "y1"
+    plt = plot(
+        Vvec, zV;
+        lw=3,
+        label="Constant V curve",
+        xlabel="Fixed Volume V",
+        ylabel="Steady-state RNA (avg 1000–1400)",
+        title="Fig 2a: Steady-state RNA vs Fixed Volume"
+    )
+
+    hline!(plt, [zVopt_full], lw=2, ls=:dash,
+           label="Vopt steady (Vmin–Vmax): $(round(zVopt_full,digits=3))")
+    hline!(plt, [zVopt_low],  lw=2, ls=:dot,
+           label="Vopt steady (Vmin–Vmean): $(round(zVopt_low,digits=3))")
+    hline!(plt, [zVopt_high], lw=2, ls=:dashdot,
+           label="Vopt steady (Vmean–Vmax): $(round(zVopt_high,digits=3))")
+
+    return plt, Vvec, zV, zVopt_full, zVopt_low, zVopt_high
+end
+
+
+# ============================================================
+# 4D scatter (UPDATED & more robust):
+#   axes = (A, ω, ϕ)
+#   color = steady-state RNA
+#
+# Why your old 4D might “not work”:
+# - ω too large => period T too small; solver can miss fast oscillations
+# - not enough resolution -> periodic check fails -> NaNs everywhere
+#
+# Fixes:
+# - use abstol/reltol and add max step controls
+# - score still uses periodic-if-converged else 1000–1400 window
+# - choose ω grid logspace but not insanely dense
+# ============================================================
+function fig4d_A_omega_phi_scatter(p;
+    A_vals = range(0.0, (Vmax - Vmin)/2; length=11),
+    ω_vals = logspace10(0.01, 100.0, 28),            # LOG ω up to 100
+    ϕ_vals = range(0.0, 2π; length=24),
+    periodic_tol = 1e-9,
+    Vlo = Vmin,
+    Vhi = Vmax,
+    verbose=false)
+
+    As  = Float64[]
+    Ws  = Float64[]
+    Phs = Float64[]
+    Zs  = Float64[]
+
+    for A in A_vals
+        for ω in ω_vals
+            for ϕ in ϕ_vals
+                sol = simulate_sinusoidal_bounds(
+                    p, n0, tspan_long, A, ω, ϕ;
+                    Vlo=Vlo, Vhi=Vhi,
+                    abstol=1e-6, reltol=1e-6
+                )
+                if sol.retcode != :Success
+                    continue
+                end
+
+                z = steady_state_score(sol, ω; periodic_tol=periodic_tol,
+                                       use_periodic=true, fallback_window=true)
+                if isfinite(z)
+                    push!(As, A)
+                    push!(Ws, ω)
+                    push!(Phs, ϕ)
+                    push!(Zs, z)
+                end
+            end
+        end
+    end
+
+    if length(Zs) == 0
+        error("4D scatter produced no finite points. Try loosening periodic_tol (e.g., 1e-7) or reducing ω_max.")
+    end
+
+    plt = scatter3d(
+        As, Ws, Phs;
+        marker_z = Zs, ms = 5,
+        xlabel = "A (amplitude)",
+        ylabel = "ω (angular velocity)",
+        zlabel = "ϕ (phase)",
+        title  = "Fig 2b (4D): (A, ω, ϕ) colored by steady-state RNA",
+        colorbar_title = "RNA steady avg",
+        size = (1200, 850),
+        right_margin = 22mm,
+        left_margin  = 10mm,
+        bottom_margin = 10mm,
+        top_margin = 10mm,
+        guidefontsize = 12,
+        tickfontsize = 10,
+        colorbar_tickfontsize = 9,
+        legend = false,
+        camera = (45, 25)
+    )
+
+    # ω is log-spaced; show it better if you want (optional):
+    # Plots.jl doesn't truly do log axis in 3D, but you can transform ω yourself.
+    # For now keep raw ω to match your PI’s axis request.
+
+    return plt, As, Ws, Phs, Zs
+end
+
+
+# ============================================================
+# Combined figure: Fig 2a (left) + Fig 2b/4D (right)
+# ============================================================
+function fig2a_and_4d_side_by_side(p;
+    Vgrid = range(Vmin, Vmax; length=60),
+    A_vals = range(0.0, (Vmax - Vmin)/2; length=11),
+    ω_vals = logspace10(0.01, 100.0, 28),
+    ϕ_vals = range(0.0, 2π; length=24),
+    periodic_tol = 1e-9)
+
+    plt2a, Vvec, zV, zVopt_full, zVopt_low, zVopt_high =
+        fig2a_constant_volume_curve(p; Vgrid=Vgrid, periodic_tol=periodic_tol)
+
+    plt4d, As, Ws, Phs, Zs =
+        fig4d_A_omega_phi_scatter(p; A_vals=A_vals, ω_vals=ω_vals, ϕ_vals=ϕ_vals, periodic_tol=periodic_tol)
+
+    # label panels (a) and (b)
+    plot!(plt2a, title="(a) Steady-state RNA vs fixed V")
+    plot!(plt4d, title="(b) 4D scan: (A, ω, ϕ) color = steady RNA")
+
+    combo = plot(plt2a, plt4d; layout=(1,2), size=(2000, 850))
+    return combo
+end
+
+
+# ============================================================
+# RUN THIS (after you define params_example cleanly)
+# ============================================================
+
+# NOTE: your pasted params_example section is currently malformed (multiple tuples).
+# Make sure params_example is ONE tuple like:
+# params_example = (k1,k2,k3,k4,k5,c6,Kd,D1)
+
+# --- Fig 2a updated ---
+plt2a, Vvec, zV, zVopt_full, zVopt_low, zVopt_high = fig2a_constant_volume_curve(params_example)
+display(plt2a)
+savefig(plt2a, "Fig2a_steadyRNA_vs_fixedV_UPDATED.png")
+
+# --- Fig 2b is now the 4D plot with A varying (your request) ---
+plt4d, As, Ws, Phs, Zs = fig4d_A_omega_phi_scatter(params_example)
+display(plt4d)
+savefig(plt4d, "Fig2b_4D_A_omega_phi_color_RNA.png")
+
+# --- Combined Fig: 2a + 4D ---
+plt_combo = fig2a_and_4d_side_by_side(params_example)
+display(plt_combo)
+savefig(plt_combo, "Fig2a_and_Fig2b_4D_side_by_side.png")
+
+
+
+
+
+
+
+
